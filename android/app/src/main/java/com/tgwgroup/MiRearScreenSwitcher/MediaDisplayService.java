@@ -129,6 +129,10 @@ public class MediaDisplayService extends Service {
     private ITaskService taskService;
     private boolean sessionsRegistered;
     private volatile boolean uiWanted;
+    /** 用户滑走媒体界面后，背屏应显示原来的桌面 */
+    private volatile boolean uiCollapsed;
+    /** 没有悬浮窗手势层时，把透明的媒体界面留在最前以接收下一次滑动 */
+    private volatile boolean collapsedTouchLayer;
     private boolean inactivePending;
 
     private String artworkKey = "";
@@ -148,7 +152,12 @@ public class MediaDisplayService extends Service {
         public void onServiceConnected(ComponentName name, IBinder binder) {
             taskService = ITaskService.Stub.asInterface(binder);
             handler.post(() -> {
-                if (uiWanted) {
+                if (!uiWanted) {
+                    return;
+                }
+                if (uiCollapsed) {
+                    keepCollapsed();
+                } else {
                     launchUi();
                 }
             });
@@ -201,7 +210,11 @@ public class MediaDisplayService extends Service {
             if (!uiWanted) {
                 return;
             }
-            keepUiOnTop();
+            if (uiCollapsed) {
+                keepCollapsed();
+            } else {
+                keepUiOnTop();
+            }
             handler.postDelayed(this, KEEPER_MS);
         }
     };
@@ -270,6 +283,33 @@ public class MediaDisplayService extends Service {
 
     public static void removeListener(Listener listener) {
         listeners.remove(listener);
+    }
+
+    public static boolean isCollapsed() {
+        MediaDisplayService service = instance;
+        return service != null && service.uiCollapsed;
+    }
+
+    /** 收起后是否还要把媒体界面拉回最前，用来接收滑动 */
+    public static void setCollapsedTouchLayer(boolean needed) {
+        MediaDisplayService service = instance;
+        if (service == null) {
+            return;
+        }
+        service.collapsedTouchLayer = needed;
+        if (needed && service.uiCollapsed) {
+            service.bringTouchLayerToFront();
+        }
+    }
+
+    /** 收起时恢复背屏桌面；展开时关掉桌面并把媒体界面拉回背屏 */
+    public static void setCollapsed(boolean collapsed) {
+        MediaDisplayService service = instance;
+        if (service == null) {
+            return;
+        }
+        service.uiCollapsed = collapsed;
+        service.handler.post(service::applyCollapsedWork);
     }
 
     public static void refreshTiles(Context context) {
@@ -645,6 +685,8 @@ public class MediaDisplayService extends Service {
     }
 
     private void startUi() {
+        uiCollapsed = false;
+        collapsedTouchLayer = false;
         uiWanted = true;
         launchUi();
         handler.removeCallbacks(keeperRunnable);
@@ -654,6 +696,8 @@ public class MediaDisplayService extends Service {
     private void stopUi() {
         boolean wasWanted = uiWanted;
         uiWanted = false;
+        uiCollapsed = false;
+        collapsedTouchLayer = false;
         handler.removeCallbacks(keeperRunnable);
         sendBroadcast(new Intent(ACTION_FINISH).setPackage(getPackageName()));
         if (!wasWanted) {
@@ -682,13 +726,136 @@ public class MediaDisplayService extends Service {
             return;
         }
         shell.execute(() -> {
+            if (!uiWanted || uiCollapsed) {
+                return;
+            }
             try {
                 service.disableSubScreenLauncher();
+                if (!uiWanted || uiCollapsed) {
+                    return;
+                }
                 service.executeShellCommand(launchCommand());
                 SystemClock.sleep(600);
+                if (!uiWanted || uiCollapsed) {
+                    return;
+                }
                 moveUiToRearIfNeeded(service);
             } catch (Exception e) {
                 Log.e(TAG, "启动背屏媒体界面失败", e);
+            }
+        });
+    }
+
+    private void applyCollapsedWork() {
+        if (taskService == null) {
+            bindTaskService();
+            return;
+        }
+        if (uiCollapsed) {
+            showLauncherBehind();
+        } else if (uiWanted) {
+            restoreMediaFront();
+        }
+    }
+
+    /** 收起后启动背屏桌面。需要手势层时，再把透明的媒体界面拉回最前 */
+    private void showLauncherBehind() {
+        if (shell.isShutdown()) {
+            return;
+        }
+        shell.execute(() -> {
+            if (!uiCollapsed || !uiWanted) {
+                return;
+            }
+            ITaskService service = taskService;
+            if (service == null) {
+                return;
+            }
+            try {
+                service.enableSubScreenLauncher();
+                if (!uiCollapsed || !uiWanted || !collapsedTouchLayer) {
+                    return;
+                }
+                service.executeShellCommand(launchCommand());
+            } catch (Exception e) {
+                Log.w(TAG, "收起后恢复背屏桌面失败", e);
+            }
+        });
+    }
+
+    private void bringTouchLayerToFront() {
+        if (shell.isShutdown()) {
+            return;
+        }
+        shell.execute(() -> {
+            if (!uiCollapsed || !uiWanted || !collapsedTouchLayer) {
+                return;
+            }
+            ITaskService service = taskService;
+            if (service == null) {
+                return;
+            }
+            try {
+                service.executeShellCommand(launchCommand());
+            } catch (Exception e) {
+                Log.w(TAG, "拉回媒体手势层失败", e);
+            }
+        });
+    }
+
+    private void restoreMediaFront() {
+        if (shell.isShutdown()) {
+            return;
+        }
+        shell.execute(() -> {
+            if (uiCollapsed || !uiWanted) {
+                return;
+            }
+            ITaskService service = taskService;
+            if (service == null) {
+                return;
+            }
+            try {
+                service.disableSubScreenLauncher();
+                if (uiCollapsed || !uiWanted) {
+                    return;
+                }
+                service.executeShellCommand(launchCommand());
+            } catch (Exception e) {
+                Log.w(TAG, "展开媒体界面失败", e);
+            }
+        });
+    }
+
+    /** 收起期间保持背屏桌面。没有悬浮窗时，才把透明媒体界面留在最前 */
+    private void keepCollapsed() {
+        if (shell.isShutdown()) {
+            return;
+        }
+        shell.execute(() -> {
+            if (!uiWanted || !uiCollapsed) {
+                return;
+            }
+            ITaskService service = taskService;
+            if (service == null) {
+                return;
+            }
+            try {
+                if (collapsedTouchLayer) {
+                    String front = service.getForegroundAppOnDisplay(1);
+                    if (front != null && front.startsWith(getPackageName() + ":")) {
+                        return;
+                    }
+                    service.executeShellCommand(launchCommand());
+                    return;
+                }
+                String front = service.getForegroundAppOnDisplay(1);
+                if (front != null && front.contains("com.xiaomi.subscreencenter")) {
+                    return;
+                }
+                service.enableSubScreenLauncher();
+            } catch (Exception e) {
+                Log.w(TAG, "收起后保持背屏桌面失败", e);
             }
         });
     }
@@ -703,7 +870,7 @@ public class MediaDisplayService extends Service {
             return;
         }
         shell.execute(() -> {
-            if (!uiWanted) {
+            if (!uiWanted || uiCollapsed) {
                 return;
             }
             try {
@@ -711,9 +878,18 @@ public class MediaDisplayService extends Service {
                 if (front != null && front.startsWith(getPackageName() + ":")) {
                     return;
                 }
+                if (!uiWanted || uiCollapsed) {
+                    return;
+                }
                 service.disableSubScreenLauncher();
+                if (!uiWanted || uiCollapsed) {
+                    return;
+                }
                 service.executeShellCommand(launchCommand());
                 SystemClock.sleep(600);
+                if (!uiWanted || uiCollapsed) {
+                    return;
+                }
                 moveUiToRearIfNeeded(service);
             } catch (Exception e) {
                 Log.w(TAG, "确认背屏媒体界面失败", e);

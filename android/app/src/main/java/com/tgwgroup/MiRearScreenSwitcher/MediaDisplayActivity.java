@@ -23,8 +23,10 @@ import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Outline;
+import android.graphics.PixelFormat;
 import android.graphics.RenderEffect;
 import android.graphics.Shader;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.display.DisplayManager;
 import android.os.Build;
@@ -33,8 +35,10 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.util.Log;
 import android.util.TypedValue;
 import android.view.Display;
+import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -53,10 +57,11 @@ import java.util.Date;
 import java.util.Locale;
 
 /**
- * 背屏媒体界面。从右侧向左滑动隐藏，再滑一次拉出。
+ * 背屏媒体界面。从右侧滑走后露出原来的背屏桌面，再从右侧滑一次拉出。
  * 背屏 Activity 的 DisplayMetrics 可能是主屏的，所以尺寸全部按实际布局像素计算。
  */
 public class MediaDisplayActivity extends Activity implements MediaDisplayService.Listener {
+    private static final String TAG = "MediaDisplayActivity";
     private static final int REAR_DISPLAY_ID = 1;
     private static final long POLL_MS = 500L;
     private static final long FADE_MS = 200L;
@@ -93,6 +98,8 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private DisplayManager displayManager;
     private MediaDisplayService.MediaSnapshot snapshot = MediaDisplayService.MediaSnapshot.inactive();
     private boolean hidden;
+    private boolean hiddenSettled;
+    private boolean leavingFront;
     private boolean displayOn = true;
     private int sizedWidth;
     private int sizedHeight;
@@ -103,6 +110,10 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private boolean trackingEdge;
     private long lastToggleMs;
     private boolean finishReceiverRegistered;
+    private View edgeCatcher;
+    private WindowManager edgeWindowManager;
+    private float edgeTouchStartX;
+    private float edgeTouchStartY;
 
     private final BroadcastReceiver finishReceiver = new BroadcastReceiver() {
         @Override
@@ -167,6 +178,9 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         instance = this;
         setContentView(R.layout.activity_media_display);
         bindViews();
+        getWindow().setFormat(PixelFormat.TRANSLUCENT);
+        getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        getWindow().getDecorView().setBackgroundColor(Color.TRANSPARENT);
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
@@ -194,6 +208,11 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         if (isFinishing()) {
             return;
         }
+        if (MediaDisplayService.isCollapsed()) {
+            hidden = true;
+            applyHiddenImmediate();
+            root.post(this::settleHidden);
+        }
         // am start 偶尔落到主屏：退到后台，等服务把任务移到背屏
         if (!isOnRearDisplay()) {
             moveTaskToBack(true);
@@ -220,7 +239,39 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        if (isFinishing()) {
+            return;
+        }
+        if (hidden && MediaDisplayService.isCollapsed()) {
+            applyWindowAlpha(0f);
+            if (edgeCatcher != null) {
+                setWindowTouchable(false);
+                if (!leavingFront) {
+                    leavingFront = true;
+                    moveTaskToBack(true);
+                    handler.postDelayed(() -> leavingFront = false, 500);
+                }
+            }
+            return;
+        }
+        if (hidden) {
+            setHidden(false, true);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (hidden) {
+            settleHidden();
+        }
+    }
+
+    @Override
     protected void onDestroy() {
+        removeEdgeCatcher();
         handler.removeCallbacksAndMessages(null);
         MediaDisplayService.removeListener(this);
         if (displayManager != null) {
@@ -504,7 +555,17 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             return;
         }
         hidden = hide;
+        hiddenSettled = false;
         lastToggleMs = SystemClock.elapsedRealtime();
+        if (hide) {
+            MediaDisplayService.setCollapsed(true);
+        } else {
+            removeEdgeCatcher();
+            MediaDisplayService.setCollapsedTouchLayer(false);
+            setWindowTouchable(true);
+            applyWindowAlpha(1f);
+            MediaDisplayService.setCollapsed(false);
+        }
         float width = root.getWidth() > 0 ? root.getWidth() : getResources().getDisplayMetrics().widthPixels;
         float targetX = hide ? width : 0f;
         float targetAlpha = hide ? 0f : 1f;
@@ -513,12 +574,161 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             layer.setVisibility(hide ? View.INVISIBLE : View.VISIBLE);
             layer.setAlpha(targetAlpha);
             layer.setTranslationX(targetX);
+            if (hide) {
+                settleHidden();
+            }
             return;
         }
         layer.setVisibility(View.VISIBLE);
         layer.animate().alpha(targetAlpha).translationX(targetX).setDuration(FADE_MS)
-                .withEndAction(() -> layer.setVisibility(hidden ? View.INVISIBLE : View.VISIBLE))
+                .withEndAction(() -> {
+                    if (hide != hidden) {
+                        return;
+                    }
+                    layer.setVisibility(hidden ? View.INVISIBLE : View.VISIBLE);
+                    if (hidden) {
+                        settleHidden();
+                    }
+                })
                 .start();
+    }
+
+    /** 滑走结束后让出背屏，桌面才能显示出来。右缘手势层负责再滑一次拉出 */
+    private void settleHidden() {
+        if (!hidden || hiddenSettled || isFinishing()) {
+            return;
+        }
+        hiddenSettled = true;
+        applyHiddenImmediate();
+        boolean overlay = showEdgeCatcher();
+        MediaDisplayService.setCollapsedTouchLayer(!overlay);
+        Log.d(TAG, overlay ? "收起后显示背屏桌面" : "收起后使用透明手势层");
+        if (overlay) {
+            setWindowTouchable(false);
+            leavingFront = true;
+            moveTaskToBack(true);
+            handler.postDelayed(() -> leavingFront = false, 500);
+        }
+    }
+
+    private void setWindowTouchable(boolean touchable) {
+        if (touchable) {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
+        } else {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
+        }
+    }
+
+    private void applyHiddenImmediate() {
+        hidden = true;
+        if (layer != null) {
+            layer.animate().cancel();
+            float width = root != null && root.getWidth() > 0 ? root.getWidth() : 0f;
+            layer.setAlpha(0f);
+            layer.setTranslationX(width);
+            layer.setVisibility(View.INVISIBLE);
+        }
+        applyWindowAlpha(0f);
+    }
+
+    private void applyWindowAlpha(float alpha) {
+        WindowManager.LayoutParams params = getWindow().getAttributes();
+        if (params.alpha == alpha) {
+            return;
+        }
+        params.alpha = alpha;
+        getWindow().setAttributes(params);
+    }
+
+    /** 桌面在前台时，右缘这条透明层接收下一次滑出 */
+    private boolean showEdgeCatcher() {
+        if (edgeCatcher != null) {
+            return true;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return false;
+        }
+        DisplayManager manager = displayManager;
+        if (manager == null) {
+            manager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+        }
+        Display display = manager == null ? null : manager.getDisplay(REAR_DISPLAY_ID);
+        if (display == null) {
+            return false;
+        }
+        try {
+            Context windowContext = createWindowContext(
+                    display, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null);
+            WindowManager managerOnDisplay = windowContext.getSystemService(WindowManager.class);
+            if (managerOnDisplay == null) {
+                return false;
+            }
+            int screenWidth = display.getWidth();
+            int screenHeight = display.getHeight();
+            int strip = Math.max(1, Math.round(screenWidth * EDGE_ZONE_RATIO));
+            View edge = new View(windowContext);
+            edge.setBackgroundColor(Color.TRANSPARENT);
+            edge.setClickable(true);
+            edge.setOnTouchListener((view, event) -> onEdgeTouch(event, screenWidth));
+            WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                    strip,
+                    screenHeight > 0 ? screenHeight : WindowManager.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.TRANSLUCENT);
+            params.gravity = Gravity.TOP | Gravity.END;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                params.layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            }
+            managerOnDisplay.addView(edge, params);
+            edgeCatcher = edge;
+            edgeWindowManager = managerOnDisplay;
+            return true;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "背屏手势层添加失败", e);
+            edgeCatcher = null;
+            edgeWindowManager = null;
+            return false;
+        }
+    }
+
+    private boolean onEdgeTouch(MotionEvent event, float screenWidth) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                edgeTouchStartX = event.getX();
+                edgeTouchStartY = event.getY();
+                break;
+            case MotionEvent.ACTION_MOVE:
+                float dx = event.getX() - edgeTouchStartX;
+                float dy = event.getY() - edgeTouchStartY;
+                if (dx <= -screenWidth * SWIPE_RATIO && Math.abs(dx) > Math.abs(dy)) {
+                    edgeTouchStartX = event.getX();
+                    handler.post(() -> setHidden(false, true));
+                    return true;
+                }
+                break;
+            default:
+                break;
+        }
+        return true;
+    }
+
+    private void removeEdgeCatcher() {
+        View edge = edgeCatcher;
+        WindowManager manager = edgeWindowManager;
+        edgeCatcher = null;
+        edgeWindowManager = null;
+        if (edge == null || manager == null) {
+            return;
+        }
+        try {
+            manager.removeView(edge);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "移除背屏手势层失败", e);
+        }
     }
 
     private boolean isOnRearDisplay() {
