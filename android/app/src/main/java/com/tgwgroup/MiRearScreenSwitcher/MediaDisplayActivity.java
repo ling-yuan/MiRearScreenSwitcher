@@ -24,7 +24,6 @@ import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Outline;
 import android.graphics.PixelFormat;
-import android.graphics.Rect;
 import android.graphics.RenderEffect;
 import android.graphics.Shader;
 import android.graphics.drawable.ColorDrawable;
@@ -39,7 +38,6 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Display;
-import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -54,14 +52,12 @@ import android.widget.TextView;
 import android.window.OnBackInvokedDispatcher;
 
 import java.text.SimpleDateFormat;
-import java.util.Collections;
 import java.util.Date;
-import java.util.List;
 import java.util.Locale;
 
 /**
- * 背屏媒体界面。从右侧向里滑收起，再从右侧滑一次拉出。
- * 收起后窗口只剩右侧一条，其余区域的触摸直接落到原来的背屏桌面。
+ * 背屏媒体界面。从右侧向左滑收起，界面随即关闭，背屏上不留 MRSS 的窗口。
+ * 再次拉出由 MediaDisplayService 在后台识别背屏右边缘左滑后重新启动本界面。
  * 背屏 Activity 的 DisplayMetrics 可能是主屏的，所以尺寸全部按实际布局像素计算。
  */
 public class MediaDisplayActivity extends Activity implements MediaDisplayService.Listener {
@@ -71,14 +67,8 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private static final long FADE_MS = 200L;
     /** 右侧触发区占屏宽的比例，需大于系统返回手势的保留区 */
     private static final float EDGE_ZONE_RATIO = 0.30f;
-    /** 触发隐藏或拉出所需的横向滑动距离占屏宽的比例 */
+    /** 触发隐藏所需的横向滑动距离占屏宽的比例 */
     private static final float SWIPE_RATIO = 0.12f;
-    /** 先看出方向再决定是否交给背屏桌面，约占屏宽 */
-    private static final float DIRECTION_SLOP_RATIO = 0.025f;
-    /** 收起后窗口只保留右侧这么宽。越窄，桌面自己的左滑越少被占用 */
-    private static final float COLLAPSED_STRIP_RATIO = 0.15f;
-    /** 拉出所需的横向距离比收起时短，手指在窄窗口里起步 */
-    private static final float RECALL_SWIPE_RATIO = 0.08f;
     /** 左侧摄像头区域占屏宽的比例，内容只放在右侧 */
     private static final float CAMERA_ZONE_RATIO = 1f / 3f;
 
@@ -119,11 +109,6 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private boolean trackingEdge;
     private long lastToggleMs;
     private boolean finishReceiverRegistered;
-    private int rearWidth;
-    private int rearHeight;
-    private long hiddenDownMs;
-    private boolean hiddenGestureDone;
-    private final Runnable restoreTouchRunnable = () -> setWindowTouchable(true);
 
     private final BroadcastReceiver finishReceiver = new BroadcastReceiver() {
         @Override
@@ -219,9 +204,8 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             return;
         }
         if (MediaDisplayService.isCollapsed()) {
-            hidden = true;
-            applyHiddenImmediate();
-            root.post(this::settleHidden);
+            finishQuietly();
+            return;
         }
         // am start 偶尔落到主屏：退到后台，等服务把任务移到背屏
         if (!isOnRearDisplay()) {
@@ -239,11 +223,6 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         }
         sizedWidth = 0;
         sizedHeight = 0;
-        rearWidth = 0;
-        rearHeight = 0;
-        if (hidden) {
-            applyWindowStrip(true);
-        }
         root.requestLayout();
     }
 
@@ -251,21 +230,6 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        if (isFinishing()) {
-            return;
-        }
-        if (hidden && MediaDisplayService.isCollapsed()) {
-            applyWindowStrip(true);
-            return;
-        }
-        if (hidden) {
-            setHidden(false, true);
-        }
     }
 
     @Override
@@ -302,7 +266,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
         if (hidden) {
-            return onCollapsedTouch(event);
+            return true;
         }
         float width = root == null ? 0f : root.getWidth();
         if (width <= 0f) {
@@ -320,8 +284,6 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                     float dy = event.getY() - touchStartY;
                     if (dx <= -width * SWIPE_RATIO && Math.abs(dx) > Math.abs(dy)) {
                         trackingEdge = false;
-                        // 这次手势剩下的移动不能再被当成拉出手势
-                        hiddenGestureDone = true;
                         setHidden(true, true);
                         MotionEvent cancel = MotionEvent.obtain(event);
                         cancel.setAction(MotionEvent.ACTION_CANCEL);
@@ -339,71 +301,6 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 break;
         }
         return super.dispatchTouchEvent(event);
-    }
-
-    /**
-     * 收起后窗口只剩右侧一条。这里只认从右往左滑，用来拉出界面。
-     * 在这条里起步的其余滑动和点按，在手指抬起后原样补给背屏桌面。
-     */
-    private boolean onCollapsedTouch(MotionEvent event) {
-        float width = rearScreenWidth();
-        switch (event.getActionMasked()) {
-            case MotionEvent.ACTION_DOWN:
-                touchStartX = event.getRawX();
-                touchStartY = event.getRawY();
-                hiddenDownMs = SystemClock.uptimeMillis();
-                hiddenGestureDone = false;
-                return true;
-            case MotionEvent.ACTION_MOVE: {
-                if (hiddenGestureDone || width <= 0f) {
-                    return true;
-                }
-                float dx = event.getRawX() - touchStartX;
-                float dy = event.getRawY() - touchStartY;
-                if (dx <= -width * RECALL_SWIPE_RATIO && Math.abs(dx) > Math.abs(dy)) {
-                    hiddenGestureDone = true;
-                    Log.d(TAG, "右侧从右往左滑，拉出媒体界面");
-                    setHidden(false, true);
-                }
-                return true;
-            }
-            case MotionEvent.ACTION_UP:
-                if (!hiddenGestureDone) {
-                    float dx = event.getRawX() - touchStartX;
-                    float dy = event.getRawY() - touchStartY;
-                    hiddenGestureDone = true;
-                    handOffToRear(event.getRawX(), event.getRawY(),
-                            !directionKnown(dx, dy, width));
-                }
-                return true;
-            default:
-                return true;
-        }
-    }
-
-    /** 这次触摸不归媒体界面：让窗口暂时不接触摸，并把手势补给背屏桌面 */
-    private void handOffToRear(float endX, float endY, boolean tap) {
-        long duration = SystemClock.uptimeMillis() - hiddenDownMs;
-        setWindowTouchable(false);
-        MediaDisplayService.injectRearPointer(Math.round(touchStartX), Math.round(touchStartY),
-                Math.round(endX), Math.round(endY), duration, tap);
-        handler.removeCallbacks(restoreTouchRunnable);
-        handler.postDelayed(restoreTouchRunnable, duration + 400);
-    }
-
-    private int rearScreenWidth() {
-        if (rearWidth > 0) {
-            return rearWidth;
-        }
-        Display display = displayManager == null ? null : displayManager.getDisplay(REAR_DISPLAY_ID);
-        if (display != null && display.getWidth() > 0) {
-            rearWidth = display.getWidth();
-            rearHeight = display.getHeight();
-        } else if (root != null && root.getWidth() > 0) {
-            rearWidth = root.getWidth();
-            rearHeight = root.getHeight();
-        }
-        return rearWidth;
     }
 
     @Override
@@ -630,13 +527,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         hidden = hide;
         hiddenSettled = false;
         lastToggleMs = SystemClock.elapsedRealtime();
-        if (hide) {
-            MediaDisplayService.setCollapsed(true);
-        } else {
-            MediaDisplayService.setCollapsedTouchLayer(false);
-            applyWindowStrip(false);
-            MediaDisplayService.setCollapsed(false);
-        }
+        MediaDisplayService.setCollapsed(hide);
         float width = root.getWidth() > 0 ? root.getWidth() : getResources().getDisplayMetrics().widthPixels;
         float targetX = hide ? width : 0f;
         float targetAlpha = hide ? 0f : 1f;
@@ -664,92 +555,19 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 .start();
     }
 
-    /** 滑走结束后把窗口收成右边缘一条，背屏桌面就露出来了 */
+    /** 滑走结束后关闭界面。留着任何窗口都会让背屏桌面的手势失效 */
     private void settleHidden() {
         if (!hidden || hiddenSettled || isFinishing()) {
             return;
         }
         hiddenSettled = true;
-        applyHiddenImmediate();
-        MediaDisplayService.setCollapsedTouchLayer(true);
-        Log.d(TAG, "收起后只保留右侧手势条");
+        Log.d(TAG, "media ui collapsed, finish");
+        finishQuietly();
     }
 
-    private void setWindowTouchable(boolean touchable) {
-        if (touchable) {
-            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
-        } else {
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE);
-        }
-    }
-
-    private void applyHiddenImmediate() {
-        hidden = true;
-        if (layer != null) {
-            layer.animate().cancel();
-            float width = root != null && root.getWidth() > 0 ? root.getWidth() : 0f;
-            layer.setAlpha(0f);
-            layer.setTranslationX(width);
-            layer.setVisibility(View.INVISIBLE);
-        }
-        applyWindowStrip(true);
-    }
-
-    /** 收起时窗口只占右侧一条；展开时恢复整屏 */
-    private void applyWindowStrip(boolean strip) {
-        handler.removeCallbacks(restoreTouchRunnable);
-        WindowManager.LayoutParams params = getWindow().getAttributes();
-        params.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-        // 不加这两个标志，窗口会吞掉整块屏幕的触摸，即使它只有一条宽
-        int passThrough = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-        if (strip) {
-            params.flags |= passThrough;
-        } else {
-            params.flags &= ~passThrough;
-        }
-        if (strip) {
-            int width = rearScreenWidth();
-            params.width = width > 0
-                    ? Math.max(48, Math.round(width * COLLAPSED_STRIP_RATIO))
-                    : WindowManager.LayoutParams.MATCH_PARENT;
-            params.height = rearHeight > 0 ? rearHeight : WindowManager.LayoutParams.MATCH_PARENT;
-            params.gravity = Gravity.TOP | Gravity.RIGHT;
-            params.alpha = 0f;
-        } else {
-            params.width = WindowManager.LayoutParams.MATCH_PARENT;
-            params.height = WindowManager.LayoutParams.MATCH_PARENT;
-            params.gravity = Gravity.TOP | Gravity.LEFT;
-            params.alpha = 1f;
-        }
-        getWindow().setAttributes(params);
-        applyGestureExclusion(strip);
-        if (!strip && root != null) {
-            sizedWidth = 0;
-            sizedHeight = 0;
-            root.requestLayout();
-        }
-    }
-
-    /** 收起后这条窄窗口要优先于系统边缘手势，否则拉出手势会被系统吃掉 */
-    private void applyGestureExclusion(boolean strip) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || root == null) {
-            return;
-        }
-        root.post(() -> {
-            if (root == null) {
-                return;
-            }
-            List<Rect> rects = strip
-                    ? Collections.singletonList(new Rect(0, 0, root.getWidth(), root.getHeight()))
-                    : Collections.emptyList();
-            root.setSystemGestureExclusionRects(rects);
-        });
-    }
-
-    private static boolean directionKnown(float dx, float dy, float width) {
-        float slop = Math.max(16f, width * DIRECTION_SLOP_RATIO);
-        return Math.abs(dx) >= slop || Math.abs(dy) >= slop;
+    private void finishQuietly() {
+        finish();
+        overridePendingTransition(0, 0);
     }
 
     private boolean isOnRearDisplay() {

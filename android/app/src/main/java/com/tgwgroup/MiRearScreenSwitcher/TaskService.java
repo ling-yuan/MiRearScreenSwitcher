@@ -947,5 +947,201 @@ public class TaskService extends ITaskService.Stub {
             return "";
         }
     }
-    
+
+    /** 起点需在右侧这个比例以内，和背屏桌面右边缘返回手势条的宽度相当 */
+    private static final float EDGE_START_RATIO = 0.10f;
+    /** 向左滑过屏宽的这个比例才算触发 */
+    private static final float EDGE_SWIPE_RATIO = 0.10f;
+
+    private static String rearTouchDevice;
+    private static int rearTouchMaxX;
+    private static int rearTouchMaxY;
+    private volatile Process edgeProcess;
+
+    /**
+     * 只读 /dev/input，不注入、不拦截，背屏桌面照常收到同一次触摸。
+     */
+    @Override
+    public boolean waitRearEdgeSwipe(int rotation, long timeoutMs) throws RemoteException {
+        if (!findRearTouchDevice()) {
+            Log.w(TAG, "未找到背屏触摸设备");
+            return false;
+        }
+        Process process;
+        try {
+            process = new ProcessBuilder("getevent", rearTouchDevice).redirectErrorStream(true).start();
+        } catch (Exception e) {
+            Log.e(TAG, "启动 getevent 失败", e);
+            return false;
+        }
+        edgeProcess = process;
+        Thread watchdog = new Thread(() -> {
+            try {
+                Thread.sleep(Math.max(1000, timeoutMs));
+            } catch (InterruptedException ignored) {
+                return;
+            }
+            process.destroy();
+        }, "RearEdgeTimeout");
+        watchdog.start();
+
+        float maxX = rearTouchMaxX;
+        float maxY = rearTouchMaxY;
+        int slot = 0;
+        boolean down = false;
+        boolean fresh = false;
+        int rawX = -1;
+        int rawY = -1;
+        float startX = 0f;
+        float startY = 0f;
+        boolean hasStart = false;
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] parts = line.trim().split("\\s+");
+                if (parts.length < 3) {
+                    continue;
+                }
+                int type;
+                int code;
+                long value;
+                try {
+                    type = Integer.parseInt(parts[parts.length - 3], 16);
+                    code = Integer.parseInt(parts[parts.length - 2], 16);
+                    value = Long.parseLong(parts[parts.length - 1], 16);
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                if (type == 3) {
+                    if (code == 0x2f) {
+                        slot = (int) value;
+                    } else if (slot == 0 && code == 0x39) {
+                        if (value == 0xffffffffL) {
+                            down = false;
+                            hasStart = false;
+                        } else {
+                            down = true;
+                            fresh = true;
+                        }
+                    } else if (slot == 0 && code == 0x35) {
+                        rawX = (int) value;
+                    } else if (slot == 0 && code == 0x36) {
+                        rawY = (int) value;
+                    }
+                    continue;
+                }
+                if (type != 0 || code != 0 || !down || rawX < 0 || rawY < 0) {
+                    continue;
+                }
+                float nx = rawX / maxX;
+                float ny = rawY / maxY;
+                float x;
+                float y;
+                switch (rotation) {
+                    case 1:
+                        x = ny;
+                        y = 1f - nx;
+                        break;
+                    case 2:
+                        x = 1f - nx;
+                        y = 1f - ny;
+                        break;
+                    case 3:
+                        x = 1f - ny;
+                        y = nx;
+                        break;
+                    default:
+                        x = nx;
+                        y = ny;
+                        break;
+                }
+                if (fresh) {
+                    fresh = false;
+                    startX = x;
+                    startY = y;
+                    hasStart = startX >= 1f - EDGE_START_RATIO;
+                    continue;
+                }
+                if (!hasStart) {
+                    continue;
+                }
+                float dx = x - startX;
+                float dy = y - startY;
+                if (dx <= -EDGE_SWIPE_RATIO && Math.abs(dx) > Math.abs(dy)) {
+                    Log.d(TAG, "rear edge swipe detected");
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "读取背屏触摸事件失败", e);
+        } finally {
+            watchdog.interrupt();
+            process.destroy();
+            if (edgeProcess == process) {
+                edgeProcess = null;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public void cancelRearEdgeWatch() throws RemoteException {
+        Process process = edgeProcess;
+        if (process != null) {
+            process.destroy();
+        }
+    }
+
+    /** 背屏触摸屏的设备名带 Touch_Input_1；主屏是 Touch_Input_0 */
+    private static synchronized boolean findRearTouchDevice() {
+        if (rearTouchDevice != null) {
+            return true;
+        }
+        try {
+            Process process = new ProcessBuilder("getevent", "-p").redirectErrorStream(true).start();
+            String device = null;
+            String chosen = null;
+            int maxX = 0;
+            int maxY = 0;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    String text = line.trim();
+                    if (text.startsWith("add device")) {
+                        if (chosen != null) {
+                            break;
+                        }
+                        device = text.substring(text.indexOf(':') + 1).trim();
+                    } else if (text.startsWith("name:") && text.contains("Touch_Input_1")) {
+                        chosen = device;
+                    } else if (chosen != null && (text.startsWith("0035") || text.startsWith("0036"))) {
+                        int index = text.indexOf("max ");
+                        if (index < 0) {
+                            continue;
+                        }
+                        int end = text.indexOf(',', index);
+                        int max = Integer.parseInt(text.substring(index + 4, end < 0 ? text.length() : end).trim());
+                        if (text.startsWith("0035")) {
+                            maxX = max;
+                        } else {
+                            maxY = max;
+                        }
+                    }
+                }
+            }
+            process.destroy();
+            if (chosen == null || maxX <= 0 || maxY <= 0) {
+                return false;
+            }
+            rearTouchDevice = chosen;
+            rearTouchMaxX = maxX;
+            rearTouchMaxY = maxY;
+            Log.d(TAG, "rear touch device " + chosen + " " + maxX + "x" + maxY);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "查找背屏触摸设备失败", e);
+            return false;
+        }
+    }
+
 }

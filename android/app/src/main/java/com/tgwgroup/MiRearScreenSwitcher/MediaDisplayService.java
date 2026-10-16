@@ -26,6 +26,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Rect;
+import android.hardware.display.DisplayManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
@@ -38,6 +39,7 @@ import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.service.quicksettings.TileService;
 import android.util.Log;
+import android.view.Display;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -131,8 +133,8 @@ public class MediaDisplayService extends Service {
     private volatile boolean uiWanted;
     /** 用户滑走媒体界面后，背屏应显示原来的桌面 */
     private volatile boolean uiCollapsed;
-    /** 没有悬浮窗手势层时，把透明的媒体界面留在最前以接收下一次滑动 */
-    private volatile boolean collapsedTouchLayer;
+    /** 收起期间在后台读背屏触摸事件，等待拉出手势 */
+    private volatile Thread edgeWatcher;
     private boolean inactivePending;
 
     private String artworkKey = "";
@@ -288,41 +290,6 @@ public class MediaDisplayService extends Service {
     public static boolean isCollapsed() {
         MediaDisplayService service = instance;
         return service != null && service.uiCollapsed;
-    }
-
-    /** 收起后媒体界面要留在最前，窗口只剩右边缘一条，用来接收拉出手势 */
-    public static void setCollapsedTouchLayer(boolean needed) {
-        MediaDisplayService service = instance;
-        if (service == null) {
-            return;
-        }
-        service.collapsedTouchLayer = needed;
-        if (needed && service.uiCollapsed) {
-            service.bringTouchLayerToFront();
-        }
-    }
-
-    /** 把一次点击或滑动补到背屏，给原来的背屏桌面 */
-    public static void injectRearPointer(int x1, int y1, int x2, int y2, long durationMs, boolean tap) {
-        MediaDisplayService service = instance;
-        if (service == null || service.shell.isShutdown()) {
-            return;
-        }
-        int safeDuration = (int) Math.max(40, Math.min(500, durationMs));
-        service.shell.execute(() -> {
-            ITaskService task = service.taskService;
-            if (task == null) {
-                return;
-            }
-            String command = tap
-                    ? "input -d 1 tap " + x1 + " " + y1
-                    : "input -d 1 swipe " + x1 + " " + y1 + " " + x2 + " " + y2 + " " + safeDuration;
-            try {
-                task.executeShellCommand(command);
-            } catch (Exception e) {
-                Log.w(TAG, "转发背屏手势失败", e);
-            }
-        });
     }
 
     /** 收起时恢复背屏桌面；展开时关掉桌面并把媒体界面拉回背屏 */
@@ -709,7 +676,6 @@ public class MediaDisplayService extends Service {
 
     private void startUi() {
         uiCollapsed = false;
-        collapsedTouchLayer = false;
         uiWanted = true;
         launchUi();
         handler.removeCallbacks(keeperRunnable);
@@ -720,7 +686,7 @@ public class MediaDisplayService extends Service {
         boolean wasWanted = uiWanted;
         uiWanted = false;
         uiCollapsed = false;
-        collapsedTouchLayer = false;
+        stopEdgeWatch();
         handler.removeCallbacks(keeperRunnable);
         sendBroadcast(new Intent(ACTION_FINISH).setPackage(getPackageName()));
         if (!wasWanted) {
@@ -775,14 +741,18 @@ public class MediaDisplayService extends Service {
             return;
         }
         if (uiCollapsed) {
-            showLauncherBehind();
-        } else if (uiWanted) {
-            restoreMediaFront();
+            showLauncher();
+            startEdgeWatch();
+        } else {
+            stopEdgeWatch();
+            if (uiWanted) {
+                restoreMediaFront();
+            }
         }
     }
 
-    /** 收起后启动背屏桌面，等它起来再把右边缘手势条放回最前 */
-    private void showLauncherBehind() {
+    /** 收起后只启动背屏桌面。背屏上不留 MRSS 的窗口，桌面手势完全不受影响 */
+    private void showLauncher() {
         if (shell.isShutdown()) {
             return;
         }
@@ -796,35 +766,79 @@ public class MediaDisplayService extends Service {
             }
             try {
                 service.enableSubScreenLauncher();
-                SystemClock.sleep(800);
-                if (!uiCollapsed || !uiWanted) {
-                    return;
-                }
-                service.executeShellCommand(launchCommand());
             } catch (Exception e) {
                 Log.w(TAG, "收起后恢复背屏桌面失败", e);
             }
         });
     }
 
-    private void bringTouchLayerToFront() {
-        if (shell.isShutdown()) {
+    /** 后台读背屏触摸事件。检测到从右边缘向左滑，就拉出媒体界面 */
+    private void startEdgeWatch() {
+        if (edgeWatcher != null) {
             return;
         }
-        shell.execute(() -> {
-            if (!uiCollapsed || !uiWanted || !collapsedTouchLayer) {
-                return;
+        Thread[] self = new Thread[1];
+        Thread watcher = new Thread(() -> {
+            while (uiWanted && uiCollapsed && edgeWatcher == self[0]) {
+                ITaskService service = taskService;
+                if (service == null) {
+                    SystemClock.sleep(500);
+                    continue;
+                }
+                long started = SystemClock.elapsedRealtime();
+                boolean swiped;
+                try {
+                    swiped = service.waitRearEdgeSwipe(rearRotation(), 30_000L);
+                } catch (Exception e) {
+                    Log.w(TAG, "监听背屏手势失败", e);
+                    swiped = false;
+                }
+                if (swiped && uiWanted && uiCollapsed && edgeWatcher == self[0]) {
+                    Log.d(TAG, "rear edge swipe: expand media ui");
+                    handler.post(() -> {
+                        if (uiWanted && uiCollapsed) {
+                            setCollapsed(false);
+                        }
+                    });
+                    break;
+                }
+                if (SystemClock.elapsedRealtime() - started < 1000) {
+                    SystemClock.sleep(1000);
+                }
             }
-            ITaskService service = taskService;
-            if (service == null) {
-                return;
-            }
+            handler.post(() -> {
+                if (edgeWatcher == self[0]) {
+                    edgeWatcher = null;
+                }
+            });
+        }, "MediaEdgeWatch");
+        self[0] = watcher;
+        edgeWatcher = watcher;
+        watcher.start();
+    }
+
+    private void stopEdgeWatch() {
+        if (edgeWatcher == null) {
+            return;
+        }
+        edgeWatcher = null;
+        ITaskService service = taskService;
+        if (service == null) {
+            return;
+        }
+        new Thread(() -> {
             try {
-                service.executeShellCommand(launchCommand());
+                service.cancelRearEdgeWatch();
             } catch (Exception e) {
-                Log.w(TAG, "拉回媒体手势层失败", e);
+                Log.w(TAG, "停止背屏手势监听失败", e);
             }
-        });
+        }, "MediaEdgeCancel").start();
+    }
+
+    private int rearRotation() {
+        DisplayManager manager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+        Display display = manager == null ? null : manager.getDisplay(1);
+        return display == null ? 0 : display.getRotation();
     }
 
     private void restoreMediaFront() {
@@ -851,8 +865,9 @@ public class MediaDisplayService extends Service {
         });
     }
 
-    /** 收起期间确认右边缘手势条仍在最前，背屏桌面在它下面 */
+    /** 收起期间背屏为空时补启动桌面；用户在背屏打开的其他应用不动 */
     private void keepCollapsed() {
+        startEdgeWatch();
         if (shell.isShutdown()) {
             return;
         }
@@ -865,16 +880,7 @@ public class MediaDisplayService extends Service {
                 return;
             }
             try {
-                if (collapsedTouchLayer) {
-                    String front = service.getForegroundAppOnDisplay(1);
-                    if (front != null && front.startsWith(getPackageName() + ":")) {
-                        return;
-                    }
-                    service.executeShellCommand(launchCommand());
-                    return;
-                }
-                String front = service.getForegroundAppOnDisplay(1);
-                if (front != null && front.contains("com.xiaomi.subscreencenter")) {
+                if (service.getForegroundAppOnDisplay(1) != null) {
                     return;
                 }
                 service.enableSubScreenLauncher();

@@ -132,5 +132,16 @@ interface ITaskService {
      */
     boolean executeShellCommand(String cmd) = 20;
     String executeShellCommandWithResult(String cmd) = 21;
+
+    /**
+     * 读背屏触摸屏原始事件，等待一次从右边缘向左的滑动。不在背屏上放任何窗口。
+     * @param rotation 背屏当前旋转 (0-3)
+     * @param timeoutMs 最长等待时间
+     * @return true=检测到；false=超时、被取消或失败
+     */
+    boolean waitRearEdgeSwipe(int rotation, long timeoutMs) = 22;
+
+    /** 结束正在进行的 waitRearEdgeSwipe */
+    void cancelRearEdgeWatch() = 23;
 }
 
