@@ -24,6 +24,7 @@ import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Outline;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.RenderEffect;
 import android.graphics.Shader;
 import android.graphics.drawable.ColorDrawable;
@@ -53,12 +54,14 @@ import android.widget.TextView;
 import android.window.OnBackInvokedDispatcher;
 
 import java.text.SimpleDateFormat;
+import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 
 /**
- * 背屏媒体界面。向右滑收起后露出原来的背屏桌面，再向右滑一次拉出。
- * 收起后只有向右滑会被截下，上、下、向左滑仍交给背屏桌面。
+ * 背屏媒体界面。从右侧向里滑收起，再从右侧滑一次拉出。
+ * 收起后窗口只剩右侧一条，其余区域的触摸直接落到原来的背屏桌面。
  * 背屏 Activity 的 DisplayMetrics 可能是主屏的，所以尺寸全部按实际布局像素计算。
  */
 public class MediaDisplayActivity extends Activity implements MediaDisplayService.Listener {
@@ -72,8 +75,10 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private static final float SWIPE_RATIO = 0.12f;
     /** 先看出方向再决定是否交给背屏桌面，约占屏宽 */
     private static final float DIRECTION_SLOP_RATIO = 0.025f;
-    /** 隐藏的框架标志：触摸移出窗口后交给下面的窗口 */
-    private static final int FLAG_SLIPPERY = 0x20000000;
+    /** 收起后窗口只保留右侧这么宽，和收起手势的触发区一致 */
+    private static final float COLLAPSED_STRIP_RATIO = EDGE_ZONE_RATIO;
+    /** 拉出所需的横向距离比收起时短，手指在窄窗口里起步 */
+    private static final float RECALL_SWIPE_RATIO = 0.08f;
     /** 左侧摄像头区域占屏宽的比例，内容只放在右侧 */
     private static final float CAMERA_ZONE_RATIO = 1f / 3f;
 
@@ -104,7 +109,6 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private MediaDisplayService.MediaSnapshot snapshot = MediaDisplayService.MediaSnapshot.inactive();
     private boolean hidden;
     private boolean hiddenSettled;
-    private boolean leavingFront;
     private boolean displayOn = true;
     private int sizedWidth;
     private int sizedHeight;
@@ -115,17 +119,11 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private boolean trackingEdge;
     private long lastToggleMs;
     private boolean finishReceiverRegistered;
-    private View edgeCatcher;
-    private WindowManager edgeWindowManager;
-    private int edgeScreenWidth;
-    private int edgeScreenHeight;
-    private float edgeTouchStartX;
-    private float edgeTouchStartY;
-    private long edgeDownMs;
-    private boolean edgeHandOff;
-    private boolean edgeRecallSent;
-    private boolean edgeTransferred;
-    private final Runnable restoreEdgeRunnable = this::restoreEdgeFrame;
+    private int rearWidth;
+    private int rearHeight;
+    private long hiddenDownMs;
+    private boolean hiddenGestureDone;
+    private final Runnable restoreTouchRunnable = () -> setWindowTouchable(true);
 
     private final BroadcastReceiver finishReceiver = new BroadcastReceiver() {
         @Override
@@ -211,7 +209,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 oldLeft, oldTop, oldRight, oldBottom) -> {
             int width = right - left;
             int height = bottom - top;
-            if (width != sizedWidth || height != sizedHeight) {
+            if (!hidden && (width != sizedWidth || height != sizedHeight)) {
                 root.post(() -> applySizes(width, height));
             }
         });
@@ -257,15 +255,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             return;
         }
         if (hidden && MediaDisplayService.isCollapsed()) {
-            applyWindowAlpha(0f);
-            if (edgeCatcher != null) {
-                setWindowTouchable(false);
-                if (!leavingFront) {
-                    leavingFront = true;
-                    moveTaskToBack(true);
-                    handler.postDelayed(() -> leavingFront = false, 500);
-                }
-            }
+            applyWindowStrip(true);
             return;
         }
         if (hidden) {
@@ -283,7 +273,6 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
 
     @Override
     protected void onDestroy() {
-        removeEdgeCatcher();
         handler.removeCallbacksAndMessages(null);
         MediaDisplayService.removeListener(this);
         if (displayManager != null) {
@@ -308,7 +297,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
         if (hidden) {
-            return edgeCatcher != null || onHiddenActivityTouch(event);
+            return onCollapsedTouch(event);
         }
         float width = root == null ? 0f : root.getWidth();
         if (width <= 0f) {
@@ -345,39 +334,68 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         return super.dispatchTouchEvent(event);
     }
 
-    /** 界面还盖在背屏上时的后备：只有向右滑才呼出，其余方向让给桌面 */
-    private boolean onHiddenActivityTouch(MotionEvent event) {
-        float width = root != null && root.getWidth() > 0 ? root.getWidth() : edgeScreenWidth;
+    /**
+     * 收起后窗口只剩右侧一条。这里只认横向滑动，用来拉出界面。
+     * 其余滑动和点按在手指抬起后原样补给背屏桌面。
+     */
+    private boolean onCollapsedTouch(MotionEvent event) {
+        float width = rearScreenWidth();
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 touchStartX = event.getRawX();
                 touchStartY = event.getRawY();
-                trackingEdge = true;
+                hiddenDownMs = SystemClock.uptimeMillis();
+                hiddenGestureDone = false;
                 return true;
-            case MotionEvent.ACTION_MOVE:
-                if (!trackingEdge || width <= 0f) {
-                    return false;
+            case MotionEvent.ACTION_MOVE: {
+                if (hiddenGestureDone || width <= 0f) {
+                    return true;
                 }
                 float dx = event.getRawX() - touchStartX;
                 float dy = event.getRawY() - touchStartY;
-                if (isRightSwipe(dx, dy, width)) {
-                    if (dx >= width * SWIPE_RATIO) {
-                        trackingEdge = false;
-                        setHidden(false, true);
-                    }
-                    return true;
+                if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) >= width * RECALL_SWIPE_RATIO) {
+                    hiddenGestureDone = true;
+                    setHidden(false, true);
                 }
-                if (directionKnown(dx, dy, width)) {
-                    trackingEdge = false;
-                    setWindowTouchable(false);
-                    moveTaskToBack(true);
-                    return false;
+                return true;
+            }
+            case MotionEvent.ACTION_UP:
+                if (!hiddenGestureDone) {
+                    float dx = event.getRawX() - touchStartX;
+                    float dy = event.getRawY() - touchStartY;
+                    hiddenGestureDone = true;
+                    handOffToRear(event.getRawX(), event.getRawY(),
+                            !directionKnown(dx, dy, width));
                 }
                 return true;
             default:
-                trackingEdge = false;
-                return false;
+                return true;
         }
+    }
+
+    /** 这次触摸不归媒体界面：让窗口暂时不接触摸，并把手势补给背屏桌面 */
+    private void handOffToRear(float endX, float endY, boolean tap) {
+        long duration = SystemClock.uptimeMillis() - hiddenDownMs;
+        setWindowTouchable(false);
+        MediaDisplayService.injectRearPointer(Math.round(touchStartX), Math.round(touchStartY),
+                Math.round(endX), Math.round(endY), duration, tap);
+        handler.removeCallbacks(restoreTouchRunnable);
+        handler.postDelayed(restoreTouchRunnable, duration + 400);
+    }
+
+    private int rearScreenWidth() {
+        if (rearWidth > 0) {
+            return rearWidth;
+        }
+        Display display = displayManager == null ? null : displayManager.getDisplay(REAR_DISPLAY_ID);
+        if (display != null && display.getWidth() > 0) {
+            rearWidth = display.getWidth();
+            rearHeight = display.getHeight();
+        } else if (root != null && root.getWidth() > 0) {
+            rearWidth = root.getWidth();
+            rearHeight = root.getHeight();
+        }
+        return rearWidth;
     }
 
     @Override
@@ -448,7 +466,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
 
     /** 参考图比例：专辑约占屏高 30%，标题约 8.5%，按钮约 13%；内容放在右侧 2/3 */
     private void applySizes(int width, int height) {
-        if (width <= 0 || height <= 0 || (width == sizedWidth && height == sizedHeight)) {
+        if (hidden || width <= 0 || height <= 0 || (width == sizedWidth && height == sizedHeight)) {
             return;
         }
         sizedWidth = width;
@@ -607,10 +625,8 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         if (hide) {
             MediaDisplayService.setCollapsed(true);
         } else {
-            removeEdgeCatcher();
             MediaDisplayService.setCollapsedTouchLayer(false);
-            setWindowTouchable(true);
-            applyWindowAlpha(1f);
+            applyWindowStrip(false);
             MediaDisplayService.setCollapsed(false);
         }
         float width = root.getWidth() > 0 ? root.getWidth() : getResources().getDisplayMetrics().widthPixels;
@@ -640,22 +656,15 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 .start();
     }
 
-    /** 滑走结束后让出背屏，桌面才能显示出来。右缘手势层负责再滑一次拉出 */
+    /** 滑走结束后把窗口收成右边缘一条，背屏桌面就露出来了 */
     private void settleHidden() {
         if (!hidden || hiddenSettled || isFinishing()) {
             return;
         }
         hiddenSettled = true;
         applyHiddenImmediate();
-        boolean overlay = showEdgeCatcher();
-        MediaDisplayService.setCollapsedTouchLayer(!overlay);
-        Log.d(TAG, overlay ? "收起后显示背屏桌面" : "收起后使用透明手势层");
-        if (overlay) {
-            setWindowTouchable(false);
-            leavingFront = true;
-            moveTaskToBack(true);
-            handler.postDelayed(() -> leavingFront = false, 500);
-        }
+        MediaDisplayService.setCollapsedTouchLayer(true);
+        Log.d(TAG, "收起后只保留右侧手势条");
     }
 
     private void setWindowTouchable(boolean touchable) {
@@ -675,239 +684,56 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             layer.setTranslationX(width);
             layer.setVisibility(View.INVISIBLE);
         }
-        applyWindowAlpha(0f);
+        applyWindowStrip(true);
     }
 
-    private void applyWindowAlpha(float alpha) {
+    /** 收起时窗口只占右侧一条；展开时恢复整屏 */
+    private void applyWindowStrip(boolean strip) {
+        handler.removeCallbacks(restoreTouchRunnable);
         WindowManager.LayoutParams params = getWindow().getAttributes();
-        if (params.alpha == alpha) {
+        params.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        if (strip) {
+            int width = rearScreenWidth();
+            params.width = width > 0
+                    ? Math.max(48, Math.round(width * COLLAPSED_STRIP_RATIO))
+                    : WindowManager.LayoutParams.MATCH_PARENT;
+            params.height = rearHeight > 0 ? rearHeight : WindowManager.LayoutParams.MATCH_PARENT;
+            params.gravity = Gravity.TOP | Gravity.RIGHT;
+            params.alpha = 0f;
+        } else {
+            params.width = WindowManager.LayoutParams.MATCH_PARENT;
+            params.height = WindowManager.LayoutParams.MATCH_PARENT;
+            params.gravity = Gravity.TOP | Gravity.LEFT;
+            params.alpha = 1f;
+        }
+        getWindow().setAttributes(params);
+        applyGestureExclusion(strip);
+        if (!strip && root != null) {
+            sizedWidth = 0;
+            sizedHeight = 0;
+            root.requestLayout();
+        }
+    }
+
+    /** 收起后这条窄窗口要优先于系统边缘手势，否则拉出手势会被系统吃掉 */
+    private void applyGestureExclusion(boolean strip) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || root == null) {
             return;
         }
-        params.alpha = alpha;
-        getWindow().setAttributes(params);
-    }
-
-    /** 盖住背屏只为识别向右滑。上下左在看出方向后交给原来的桌面 */
-    private boolean showEdgeCatcher() {
-        if (edgeCatcher != null) {
-            return true;
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            return false;
-        }
-        DisplayManager manager = displayManager;
-        if (manager == null) {
-            manager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
-        }
-        Display display = manager == null ? null : manager.getDisplay(REAR_DISPLAY_ID);
-        if (display == null) {
-            return false;
-        }
-        try {
-            Context windowContext = createWindowContext(
-                    display, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null);
-            WindowManager managerOnDisplay = windowContext.getSystemService(WindowManager.class);
-            if (managerOnDisplay == null) {
-                return false;
+        root.post(() -> {
+            if (root == null) {
+                return;
             }
-            edgeScreenWidth = display.getWidth();
-            edgeScreenHeight = display.getHeight();
-            View edge = new View(windowContext);
-            edge.setBackgroundColor(Color.TRANSPARENT);
-            edge.setClickable(true);
-            edge.setOnTouchListener((view, event) -> onEdgeTouch(event));
-            int flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                    | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                    | FLAG_SLIPPERY;
-            WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                    edgeScreenWidth > 0 ? edgeScreenWidth : WindowManager.LayoutParams.MATCH_PARENT,
-                    edgeScreenHeight > 0 ? edgeScreenHeight : WindowManager.LayoutParams.MATCH_PARENT,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    flags,
-                    PixelFormat.TRANSLUCENT);
-            params.gravity = Gravity.TOP | Gravity.START;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                params.layoutInDisplayCutoutMode =
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-            }
-            managerOnDisplay.addView(edge, params);
-            edgeCatcher = edge;
-            edgeWindowManager = managerOnDisplay;
-            return true;
-        } catch (RuntimeException e) {
-            Log.w(TAG, "背屏手势层添加失败", e);
-            edgeCatcher = null;
-            edgeWindowManager = null;
-            return false;
-        }
-    }
-
-    private boolean onEdgeTouch(MotionEvent event) {
-        float width = edgeScreenWidth;
-        switch (event.getActionMasked()) {
-            case MotionEvent.ACTION_DOWN:
-                edgeTouchStartX = event.getRawX();
-                edgeTouchStartY = event.getRawY();
-                edgeDownMs = SystemClock.uptimeMillis();
-                edgeHandOff = false;
-                edgeRecallSent = false;
-                edgeTransferred = false;
-                handler.removeCallbacks(restoreEdgeRunnable);
-                restoreEdgeFrame();
-                return true;
-            case MotionEvent.ACTION_MOVE:
-                if (edgeRecallSent || edgeHandOff || width <= 0f) {
-                    return !edgeHandOff;
-                }
-                float dx = event.getRawX() - edgeTouchStartX;
-                float dy = event.getRawY() - edgeTouchStartY;
-                if (isRightSwipe(dx, dy, width)) {
-                    if (dx >= width * SWIPE_RATIO) {
-                        edgeRecallSent = true;
-                        handler.post(() -> setHidden(false, true));
-                    }
-                    return true;
-                }
-                if (directionKnown(dx, dy, width)) {
-                    edgeHandOff = true;
-                    handOffGesture();
-                    scheduleRestoreEdge(1200);
-                }
-                return true;
-            case MotionEvent.ACTION_UP:
-                if (!edgeRecallSent && !edgeTransferred && width > 0f) {
-                    float upDx = event.getRawX() - edgeTouchStartX;
-                    float upDy = event.getRawY() - edgeTouchStartY;
-                    long elapsed = SystemClock.uptimeMillis() - edgeDownMs;
-                    if (forwardRearGesture(upDx, upDy, width, event.getRawX(), event.getRawY())) {
-                        scheduleRestoreEdge(elapsed + 250);
-                        return true;
-                    }
-                }
-                scheduleRestoreEdge(200);
-                return true;
-            case MotionEvent.ACTION_CANCEL:
-                edgeTransferred = true;
-                scheduleRestoreEdge(200);
-                return true;
-            default:
-                return true;
-        }
-    }
-
-    private static boolean isRightSwipe(float dx, float dy, float width) {
-        return directionKnown(dx, dy, width) && dx > 0f && dx > Math.abs(dy);
+            List<Rect> rects = strip
+                    ? Collections.singletonList(new Rect(0, 0, root.getWidth(), root.getHeight()))
+                    : Collections.emptyList();
+            root.setSystemGestureExclusionRects(rects);
+        });
     }
 
     private static boolean directionKnown(float dx, float dy, float width) {
         float slop = Math.max(16f, width * DIRECTION_SLOP_RATIO);
         return Math.abs(dx) >= slop || Math.abs(dy) >= slop;
-    }
-
-    /** 把窗口缩到屏外，让这次上下或向左的滑动落到背屏桌面 */
-    private void handOffGesture() {
-        View edge = edgeCatcher;
-        WindowManager manager = edgeWindowManager;
-        if (edge == null || manager == null) {
-            return;
-        }
-        WindowManager.LayoutParams params = (WindowManager.LayoutParams) edge.getLayoutParams();
-        if (params == null) {
-            return;
-        }
-        params.width = 1;
-        params.height = 1;
-        params.x = -20;
-        params.y = -20;
-        params.flags |= FLAG_SLIPPERY | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
-        try {
-            manager.updateViewLayout(edge, params);
-        } catch (RuntimeException e) {
-            Log.w(TAG, "让出背屏手势失败", e);
-        }
-    }
-
-    /** @return 已经把这次手势转给背屏桌面 */
-    private boolean forwardRearGesture(float dx, float dy, float width, float endX, float endY) {
-        if (isRightSwipe(dx, dy, width)) {
-            return false;
-        }
-        int x1 = Math.round(edgeTouchStartX);
-        int y1 = Math.round(edgeTouchStartY);
-        int x2 = Math.round(endX);
-        int y2 = Math.round(endY);
-        setEdgeTouchable(false);
-        boolean tap = !directionKnown(dx, dy, width);
-        long duration = SystemClock.uptimeMillis() - edgeDownMs;
-        MediaDisplayService.injectRearPointer(x1, y1, x2, y2, duration, tap);
-        return true;
-    }
-
-    private void setEdgeTouchable(boolean touchable) {
-        View edge = edgeCatcher;
-        WindowManager manager = edgeWindowManager;
-        if (edge == null || manager == null) {
-            return;
-        }
-        WindowManager.LayoutParams params = (WindowManager.LayoutParams) edge.getLayoutParams();
-        if (params == null) {
-            return;
-        }
-        if (touchable) {
-            params.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-        } else {
-            params.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-        }
-        try {
-            manager.updateViewLayout(edge, params);
-        } catch (RuntimeException e) {
-            Log.w(TAG, "更新背屏手势层失败", e);
-        }
-    }
-
-    private void scheduleRestoreEdge(long delayMs) {
-        handler.removeCallbacks(restoreEdgeRunnable);
-        handler.postDelayed(restoreEdgeRunnable, delayMs);
-    }
-
-    private void restoreEdgeFrame() {
-        View edge = edgeCatcher;
-        WindowManager manager = edgeWindowManager;
-        if (edge == null || manager == null) {
-            return;
-        }
-        WindowManager.LayoutParams params = (WindowManager.LayoutParams) edge.getLayoutParams();
-        if (params == null) {
-            return;
-        }
-        params.width = edgeScreenWidth > 0 ? edgeScreenWidth : WindowManager.LayoutParams.MATCH_PARENT;
-        params.height = edgeScreenHeight > 0 ? edgeScreenHeight : WindowManager.LayoutParams.MATCH_PARENT;
-        params.x = 0;
-        params.y = 0;
-        params.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
-        try {
-            manager.updateViewLayout(edge, params);
-        } catch (RuntimeException e) {
-            Log.w(TAG, "恢复背屏手势层失败", e);
-        }
-    }
-
-    private void removeEdgeCatcher() {
-        handler.removeCallbacks(restoreEdgeRunnable);
-        View edge = edgeCatcher;
-        WindowManager manager = edgeWindowManager;
-        edgeCatcher = null;
-        edgeWindowManager = null;
-        if (edge == null || manager == null) {
-            return;
-        }
-        try {
-            manager.removeView(edge);
-        } catch (RuntimeException e) {
-            Log.w(TAG, "移除背屏手势层失败", e);
-        }
     }
 
     private boolean isOnRearDisplay() {

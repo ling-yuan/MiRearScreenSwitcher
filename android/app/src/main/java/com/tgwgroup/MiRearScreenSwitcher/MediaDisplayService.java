@@ -290,7 +290,7 @@ public class MediaDisplayService extends Service {
         return service != null && service.uiCollapsed;
     }
 
-    /** 收起后是否还要把媒体界面拉回最前，用来接收滑动 */
+    /** 收起后媒体界面要留在最前，窗口只剩右边缘一条，用来接收拉出手势 */
     public static void setCollapsedTouchLayer(boolean needed) {
         MediaDisplayService service = instance;
         if (service == null) {
@@ -781,7 +781,7 @@ public class MediaDisplayService extends Service {
         }
     }
 
-    /** 收起后启动背屏桌面。需要手势层时，再把透明的媒体界面拉回最前 */
+    /** 收起后启动背屏桌面，等它起来再把右边缘手势条放回最前 */
     private void showLauncherBehind() {
         if (shell.isShutdown()) {
             return;
@@ -796,7 +796,8 @@ public class MediaDisplayService extends Service {
             }
             try {
                 service.enableSubScreenLauncher();
-                if (!uiCollapsed || !uiWanted || !collapsedTouchLayer) {
+                SystemClock.sleep(800);
+                if (!uiCollapsed || !uiWanted) {
                     return;
                 }
                 service.executeShellCommand(launchCommand());
@@ -850,7 +851,7 @@ public class MediaDisplayService extends Service {
         });
     }
 
-    /** 收起期间保持背屏桌面。没有悬浮窗时，才把透明媒体界面留在最前 */
+    /** 收起期间确认右边缘手势条仍在最前，背屏桌面在它下面 */
     private void keepCollapsed() {
         if (shell.isShutdown()) {
             return;
