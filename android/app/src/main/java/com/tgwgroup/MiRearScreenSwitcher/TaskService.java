@@ -16,11 +16,13 @@
 package com.tgwgroup.MiRearScreenSwitcher;
 
 import android.os.RemoteException;
-import android.os.SystemClock;
 import android.util.Log;
 import androidx.annotation.Keep;
 import java.io.BufferedReader;
+import java.io.FileInputStream;
 import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -960,14 +962,17 @@ public class TaskService extends ITaskService.Stub {
     private static String rearTouchDevice;
     private static int rearTouchMaxX;
     private static int rearTouchMaxY;
-    private final AtomicInteger edgeToken = new AtomicInteger();
-    private final AtomicInteger edgeReaders = new AtomicInteger();
-    private volatile Process edgeProcess;
-    private volatile CountDownLatch edgeDone;
+    private final Object edgeLock = new Object();
+    private final AtomicInteger edgeGeneration = new AtomicInteger();
+    private volatile CountDownLatch edgeHit;
+    private volatile boolean edgeMatched;
+    private volatile int edgeRotation;
+    private volatile FileInputStream edgeStream;
+    private volatile Thread edgeReader;
 
     /**
-     * 只读 /dev/input，不注入、不拦截，背屏桌面照常收到同一次触摸。
-     * 读事件放在单独线程。getevent 被背屏相机卡住时，这次调用仍按时返回。
+     * 只读 /dev/input，不注入、不拦截。读线程在收起期间一直开着，不再反复启动 getevent。
+     * 识别到右侧左滑后，由本进程直接拉出媒体界面。App 被冻结时也能立刻显示。
      */
     @Override
     public boolean waitRearEdgeSwipe(int rotation, long timeoutMs) throws RemoteException {
@@ -975,70 +980,53 @@ public class TaskService extends ITaskService.Stub {
             Log.w(TAG, "未找到背屏触摸设备");
             return false;
         }
-        int token = edgeToken.incrementAndGet();
-        long deadline = SystemClock.elapsedRealtime() + Math.max(1000L, timeoutMs);
-        while (edgeToken.get() == token && SystemClock.elapsedRealtime() < deadline) {
-            long slice = Math.min(3000L, deadline - SystemClock.elapsedRealtime());
-            if (slice <= 0) {
-                break;
-            }
-            if (watchRearEdgeOnce(token, rotation, slice)) {
-                return true;
-            }
+        edgeRotation = rotation;
+        CountDownLatch hit = ensureEdgeReader();
+        if (hit == null) {
+            return false;
         }
-        return false;
+        try {
+            if (!hit.await(Math.max(1000L, timeoutMs), TimeUnit.MILLISECONDS)) {
+                return false;
+            }
+        } catch (InterruptedException e) {
+            return false;
+        }
+        return edgeMatched;
     }
 
-    /** 一段 getevent。返回 true 表示背屏主界面上发生了从右向左滑 */
-    private boolean watchRearEdgeOnce(int token, int rotation, long sliceMs) {
-        if (edgeReaders.get() >= 3) {
-            Log.w(TAG, "rear edge reader stuck, skip");
-            SystemClock.sleep(sliceMs);
-            return false;
-        }
-        Process process;
-        try {
-            process = new ProcessBuilder("getevent", rearTouchDevice).redirectErrorStream(true).start();
-        } catch (Exception e) {
-            Log.e(TAG, "启动 getevent 失败", e);
-            return false;
-        }
-        if (edgeToken.get() != token) {
-            process.destroy();
-            return false;
-        }
-        CountDownLatch done = new CountDownLatch(1);
-        boolean[] matched = new boolean[1];
-        edgeProcess = process;
-        edgeDone = done;
-        Thread reader = new Thread(
-                () -> readRearEdge(process, rotation, token, matched, done), "RearEdgeRead");
-        reader.setDaemon(true);
-        reader.start();
-        try {
-            done.await(sliceMs, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ignored) {
-            // 下面按是否已匹配返回
-        } finally {
-            process.destroy();
-            if (edgeProcess == process) {
-                edgeProcess = null;
+    private CountDownLatch ensureEdgeReader() {
+        synchronized (edgeLock) {
+            if (edgeReader != null && edgeReader.isAlive() && edgeHit != null && !edgeMatched) {
+                return edgeHit;
             }
-            if (edgeDone == done) {
-                edgeDone = null;
+            closeEdgeStreamLocked();
+            edgeMatched = false;
+            CountDownLatch hit = new CountDownLatch(1);
+            edgeHit = hit;
+            FileInputStream stream;
+            try {
+                stream = new FileInputStream(rearTouchDevice);
+            } catch (Exception e) {
+                Log.e(TAG, "打开背屏触摸设备失败", e);
+                hit.countDown();
+                return hit;
             }
+            int generation = edgeGeneration.incrementAndGet();
+            edgeStream = stream;
+            Thread reader = new Thread(() -> readEdgeDevice(stream, generation), "RearEdgeRead");
+            reader.setDaemon(true);
+            edgeReader = reader;
+            reader.start();
+            return hit;
         }
-        return matched[0] && edgeToken.get() == token;
     }
 
-    private void readRearEdge(Process process, int rotation, int token, boolean[] matched, CountDownLatch done) {
-        if (edgeReaders.incrementAndGet() > 3) {
-            edgeReaders.decrementAndGet();
-            done.countDown();
-            return;
-        }
+    private void readEdgeDevice(FileInputStream stream, int generation) {
         float maxX = rearTouchMaxX;
         float maxY = rearTouchMaxY;
+        byte[] raw = new byte[24];
+        ByteBuffer buffer = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN);
         int slot = 0;
         boolean down = false;
         boolean fresh = false;
@@ -1047,29 +1035,19 @@ public class TaskService extends ITaskService.Stub {
         float startX = 0f;
         float startY = 0f;
         boolean hasStart = false;
-        BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
         try {
-            String line;
-            while (edgeToken.get() == token && (line = reader.readLine()) != null) {
-                String[] parts = line.trim().split("\\s+");
-                if (parts.length < 3) {
-                    continue;
-                }
-                int type;
-                int code;
-                long value;
-                try {
-                    type = Integer.parseInt(parts[parts.length - 3], 16);
-                    code = Integer.parseInt(parts[parts.length - 2], 16);
-                    value = Long.parseLong(parts[parts.length - 1], 16);
-                } catch (NumberFormatException e) {
-                    continue;
-                }
+            while (edgeGeneration.get() == generation && readFully(stream, raw)) {
+                buffer.clear();
+                buffer.getLong();
+                buffer.getLong();
+                int type = buffer.getShort() & 0xffff;
+                int code = buffer.getShort() & 0xffff;
+                int value = buffer.getInt();
                 if (type == 3) {
                     if (code == 0x2f) {
-                        slot = (int) value;
+                        slot = value;
                     } else if (slot == 0 && code == 0x39) {
-                        if (value == 0xffffffffL) {
+                        if (value < 0) {
                             down = false;
                             hasStart = false;
                         } else {
@@ -1077,35 +1055,33 @@ public class TaskService extends ITaskService.Stub {
                             fresh = true;
                         }
                     } else if (slot == 0 && code == 0x35) {
-                        rawX = (int) value;
+                        rawX = value;
                     } else if (slot == 0 && code == 0x36) {
-                        rawY = (int) value;
+                        rawY = value;
                     }
                     continue;
                 }
                 if (type != 0 || code != 0 || !down || rawX < 0 || rawY < 0) {
                     continue;
                 }
-                float nx = rawX / maxX;
-                float ny = rawY / maxY;
                 float x;
                 float y;
-                switch (rotation) {
+                switch (edgeRotation) {
                     case 1:
-                        x = ny;
-                        y = 1f - nx;
+                        x = rawY / maxY;
+                        y = 1f - rawX / maxX;
                         break;
                     case 2:
-                        x = 1f - nx;
-                        y = 1f - ny;
+                        x = 1f - rawX / maxX;
+                        y = 1f - rawY / maxY;
                         break;
                     case 3:
-                        x = 1f - ny;
-                        y = nx;
+                        x = 1f - rawY / maxY;
+                        y = rawX / maxX;
                         break;
                     default:
-                        x = nx;
-                        y = ny;
+                        x = rawX / maxX;
+                        y = rawY / maxY;
                         break;
                 }
                 if (fresh) {
@@ -1120,23 +1096,66 @@ public class TaskService extends ITaskService.Stub {
                 }
                 float dx = x - startX;
                 float dy = y - startY;
-                if (dx <= -EDGE_SWIPE_RATIO && Math.abs(dx) > Math.abs(dy)) {
-                    if (!rearHomeOnTop()) {
-                        hasStart = false;
-                        Log.d(TAG, "rear edge swipe ignored, rear home is not on top");
-                        continue;
-                    }
-                    Log.d(TAG, "rear edge swipe detected");
-                    matched[0] = true;
-                    done.countDown();
+                if (dx > -EDGE_SWIPE_RATIO || Math.abs(dx) <= Math.abs(dy)) {
+                    continue;
+                }
+                if (!rearHomeOnTop()) {
+                    hasStart = false;
+                    Log.d(TAG, "rear edge swipe ignored, rear home is not on top");
+                    continue;
+                }
+                if (edgeGeneration.get() != generation) {
                     return;
                 }
+                Log.d(TAG, "rear edge swipe detected");
+                edgeMatched = true;
+                CountDownLatch hit = edgeHit;
+                if (hit != null) {
+                    hit.countDown();
+                }
+                recallMediaUi();
+                return;
             }
         } catch (Exception e) {
-            Log.w(TAG, "读取背屏触摸事件失败", e);
-        } finally {
-            edgeReaders.decrementAndGet();
-            done.countDown();
+            if (edgeGeneration.get() == generation) {
+                Log.w(TAG, "读取背屏触摸事件失败", e);
+            }
+        }
+    }
+
+    private static boolean readFully(FileInputStream stream, byte[] raw) throws Exception {
+        int offset = 0;
+        while (offset < raw.length) {
+            int read = stream.read(raw, offset, raw.length - offset);
+            if (read < 0) {
+                return false;
+            }
+            offset += read;
+        }
+        return true;
+    }
+
+    /**
+     * 直接在 shell 进程里拉出媒体界面。
+     * 背屏相机用过后 App 进程可能被系统冻结，等 App 回调会晚好几秒。
+     */
+    private void recallMediaUi() {
+        try {
+            Process process = new ProcessBuilder("sh", "-c",
+                    "am force-stop com.xiaomi.subscreencenter; "
+                            + "am start --display 1 -n com.tgwgroup.MiRearScreenSwitcher/.MediaDisplayActivity --ez "
+                            + MediaDisplayActivity.EXTRA_RECALL + " true")
+                    .redirectErrorStream(true)
+                    .start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    Log.d(TAG, "recall media ui: " + line);
+                }
+            }
+            process.waitFor();
+        } catch (Exception e) {
+            Log.w(TAG, "拉出媒体界面失败", e);
         }
     }
 
@@ -1174,14 +1193,26 @@ public class TaskService extends ITaskService.Stub {
 
     @Override
     public void cancelRearEdgeWatch() throws RemoteException {
-        edgeToken.incrementAndGet();
-        Process process = edgeProcess;
-        CountDownLatch done = edgeDone;
-        if (process != null) {
-            process.destroy();
+        synchronized (edgeLock) {
+            edgeGeneration.incrementAndGet();
+            edgeMatched = false;
+            closeEdgeStreamLocked();
+            CountDownLatch hit = edgeHit;
+            edgeHit = null;
+            if (hit != null) {
+                hit.countDown();
+            }
         }
-        if (done != null) {
-            done.countDown();
+    }
+
+    private void closeEdgeStreamLocked() {
+        FileInputStream stream = edgeStream;
+        edgeStream = null;
+        if (stream != null) {
+            try {
+                stream.close();
+            } catch (Exception ignored) {
+            }
         }
     }
 

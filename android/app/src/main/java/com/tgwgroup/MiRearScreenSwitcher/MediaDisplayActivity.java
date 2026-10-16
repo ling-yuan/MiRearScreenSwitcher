@@ -62,6 +62,8 @@ import java.util.Locale;
  */
 public class MediaDisplayActivity extends Activity implements MediaDisplayService.Listener {
     private static final String TAG = "MediaDisplayActivity";
+    /** TaskService 识别到背屏右侧左滑后启动本界面时带上 */
+    static final String EXTRA_RECALL = "recall";
     private static final int REAR_DISPLAY_ID = 1;
     private static final long POLL_MS = 500L;
     private static final long FADE_MS = 200L;
@@ -204,8 +206,11 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             return;
         }
         if (MediaDisplayService.isCollapsed()) {
-            finishQuietly();
-            return;
+            if (!getIntent().getBooleanExtra(EXTRA_RECALL, false)) {
+                finishQuietly();
+                return;
+            }
+            MediaDisplayService.setCollapsed(false);
         }
         // am start 偶尔落到主屏：退到后台，等服务把任务移到背屏
         if (!isOnRearDisplay()) {
@@ -230,6 +235,18 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        if (!intent.getBooleanExtra(EXTRA_RECALL, false)) {
+            return;
+        }
+        hidden = false;
+        hiddenSettled = false;
+        MediaDisplayService.setCollapsed(false);
+        if (layer != null) {
+            layer.animate().cancel();
+            layer.setVisibility(View.VISIBLE);
+            layer.setAlpha(1f);
+            layer.setTranslationX(0f);
+        }
     }
 
     @Override
