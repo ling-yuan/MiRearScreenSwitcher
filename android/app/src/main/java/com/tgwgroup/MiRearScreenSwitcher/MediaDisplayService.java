@@ -41,6 +41,11 @@ import android.util.Log;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import rikka.shizuku.Shizuku;
 
@@ -54,6 +59,10 @@ public class MediaDisplayService extends Service {
     public static final String ACTION_FINISH = "com.tgwgroup.MiRearScreenSwitcher.MEDIA_FINISH";
     private static final int NOTIFICATION_ID = 10005;
     private static final int DEFAULT_THEME = 0xFF4A2030;
+    private static final long POLL_MS = 1000L;
+    private static final long KEEPER_MS = 3000L;
+    /** 切歌时播放器会短暂上报停止，超过这个时长才认为没有媒体 */
+    private static final long INACTIVE_GRACE_MS = 3000L;
 
     public interface Listener {
         void onMediaChanged(MediaSnapshot snapshot);
@@ -92,20 +101,40 @@ public class MediaDisplayService extends Service {
             return new MediaSnapshot(false, false, "", "", null, DEFAULT_THEME, 0,
                     false, false, false, false);
         }
+
+        boolean sameAs(MediaSnapshot other) {
+            return other != null
+                    && active == other.active
+                    && playing == other.playing
+                    && artwork == other.artwork
+                    && themeColor == other.themeColor
+                    && durationMs == other.durationMs
+                    && canPrev == other.canPrev
+                    && canNext == other.canNext
+                    && canPlay == other.canPlay
+                    && canPause == other.canPause
+                    && title.equals(other.title)
+                    && artist.equals(other.artist);
+        }
     }
 
     private static MediaDisplayService instance;
-    private static MediaSnapshot snapshot = MediaSnapshot.inactive();
-    private static final List<Listener> listeners = new ArrayList<>();
+    private static volatile MediaSnapshot snapshot = MediaSnapshot.inactive();
+    private static final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ExecutorService shell = Executors.newSingleThreadExecutor();
     private MediaSessionManager sessionManager;
-    private MediaController controller;
-    private List<MediaController> currentSessions = new ArrayList<>();
+    private volatile MediaController controller;
     private ITaskService taskService;
     private boolean sessionsRegistered;
-    private int artGeneration;
-    private long lastLaunchMs;
+    private volatile boolean uiWanted;
+    private boolean inactivePending;
+
+    private String artworkKey = "";
+    private Bitmap artwork;
+    private int artworkColor = DEFAULT_THEME;
+    private String loadingUri;
 
     private final Shizuku.UserServiceArgs serviceArgs = new Shizuku.UserServiceArgs(
             new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -119,8 +148,8 @@ public class MediaDisplayService extends Service {
         public void onServiceConnected(ComponentName name, IBinder binder) {
             taskService = ITaskService.Stub.asInterface(binder);
             handler.post(() -> {
-                if (snapshot.active) {
-                    ensureUi();
+                if (uiWanted) {
+                    launchUi();
                 }
             });
         }
@@ -142,30 +171,45 @@ public class MediaDisplayService extends Service {
     private final MediaController.Callback controllerCallback = new MediaController.Callback() {
         @Override
         public void onPlaybackStateChanged(PlaybackState state) {
-            publishFromController();
+            refreshState();
         }
 
         @Override
         public void onMetadataChanged(MediaMetadata metadata) {
-            publishFromController();
+            refreshState();
         }
 
         @Override
         public void onSessionDestroyed() {
-            controller = null;
-            onSessionsChanged(currentSessions);
+            refreshSessions();
         }
     };
 
-    private final Runnable ensureRunnable = new Runnable() {
+    /** 部分播放器不回调元数据变化（例如把歌词写进标题），所以定时补拉一次 */
+    private final Runnable pollRunnable = new Runnable() {
         @Override
         public void run() {
-            if (instance == null || !snapshot.active || !isModeEnabled(MediaDisplayService.this)) {
+            refreshSessions();
+            handler.postDelayed(this, POLL_MS);
+        }
+    };
+
+    /** 小米背屏桌面会自己拉起并盖住界面，定时确认背屏顶部仍是本界面 */
+    private final Runnable keeperRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!uiWanted) {
                 return;
             }
-            ensureUi();
-            handler.postDelayed(this, 3000);
+            keepUiOnTop();
+            handler.postDelayed(this, KEEPER_MS);
         }
+    };
+
+    private final Runnable inactiveRunnable = () -> {
+        inactivePending = false;
+        publish(MediaSnapshot.inactive());
+        stopUi();
     };
 
     public static boolean isModeEnabled(Context context) {
@@ -180,16 +224,26 @@ public class MediaDisplayService extends Service {
         return snapshot;
     }
 
+    /** 按上次上报的位置和流逝时间推算当前进度 */
     public static long currentPosition() {
         MediaDisplayService service = instance;
-        if (service == null || service.controller == null) {
+        MediaController current = service == null ? null : service.controller;
+        if (current == null) {
             return 0;
         }
-        PlaybackState state = service.controller.getPlaybackState();
+        PlaybackState state = current.getPlaybackState();
         if (state == null) {
             return 0;
         }
-        return Math.max(0, state.getPosition());
+        long position = state.getPosition();
+        if (state.getState() == PlaybackState.STATE_PLAYING) {
+            long elapsed = SystemClock.elapsedRealtime() - state.getLastPositionUpdateTime();
+            float speed = state.getPlaybackSpeed() > 0 ? state.getPlaybackSpeed() : 1f;
+            if (elapsed > 0) {
+                position += (long) (elapsed * speed);
+            }
+        }
+        return Math.max(0, position);
     }
 
     public static void skipToPrevious() {
@@ -201,22 +255,17 @@ public class MediaDisplayService extends Service {
     }
 
     public static void playPause() {
-        MediaDisplayService service = instance;
-        if (service == null || service.controller == null) {
-            return;
-        }
-        MediaController.TransportControls controls = service.controller.getTransportControls();
-        if (snapshot.playing) {
-            controls.pause();
-        } else {
-            controls.play();
-        }
+        transport(controls -> {
+            if (snapshot.playing) {
+                controls.pause();
+            } else {
+                controls.play();
+            }
+        });
     }
 
     public static void addListener(Listener listener) {
-        if (!listeners.contains(listener)) {
-            listeners.add(listener);
-        }
+        listeners.addIfAbsent(listener);
     }
 
     public static void removeListener(Listener listener) {
@@ -240,10 +289,16 @@ public class MediaDisplayService extends Service {
 
     private static void transport(TransportAction action) {
         MediaDisplayService service = instance;
-        if (service == null || service.controller == null) {
+        MediaController current = service == null ? null : service.controller;
+        if (current == null) {
             return;
         }
-        action.run(service.controller.getTransportControls());
+        try {
+            action.run(current.getTransportControls());
+        } catch (Exception e) {
+            Log.w(TAG, "发送播放控制失败", e);
+        }
+        service.handler.postDelayed(service::refreshState, 300);
     }
 
     @Override
@@ -254,6 +309,7 @@ public class MediaDisplayService extends Service {
         sessionManager = (MediaSessionManager) getSystemService(MEDIA_SESSION_SERVICE);
         bindTaskService();
         registerSessions();
+        handler.postDelayed(pollRunnable, POLL_MS);
     }
 
     @Override
@@ -275,15 +331,16 @@ public class MediaDisplayService extends Service {
 
     @Override
     public void onDestroy() {
-        handler.removeCallbacks(ensureRunnable);
+        handler.removeCallbacksAndMessages(null);
         unregisterSessions();
         if (controller != null) {
             controller.unregisterCallback(controllerCallback);
             controller = null;
         }
         publish(MediaSnapshot.inactive());
-        requestFinishUi();
-        unbindTaskService();
+        stopUi();
+        shell.execute(this::unbindTaskService);
+        shell.shutdown();
         if (instance == this) {
             instance = null;
         }
@@ -320,21 +377,30 @@ public class MediaDisplayService extends Service {
         sessionsRegistered = false;
     }
 
-    private void onSessionsChanged(List<MediaController> controllers) {
-        currentSessions = controllers == null ? new ArrayList<>() : controllers;
-        MediaController next = pick(currentSessions);
-        if (sameSession(controller, next)) {
-            publishFromController();
+    private void refreshSessions() {
+        if (sessionManager == null) {
             return;
         }
-        if (controller != null) {
-            controller.unregisterCallback(controllerCallback);
+        try {
+            onSessionsChanged(sessionManager.getActiveSessions(
+                    new ComponentName(this, NotificationService.class)));
+        } catch (SecurityException e) {
+            Log.w(TAG, "读取媒体会话失败", e);
         }
-        controller = next;
-        if (controller != null) {
-            controller.registerCallback(controllerCallback, handler);
+    }
+
+    private void onSessionsChanged(List<MediaController> controllers) {
+        MediaController next = pick(controllers == null ? new ArrayList<>() : controllers);
+        if (!sameSession(controller, next)) {
+            if (controller != null) {
+                controller.unregisterCallback(controllerCallback);
+            }
+            controller = next;
+            if (controller != null) {
+                controller.registerCallback(controllerCallback, handler);
+            }
         }
-        publishFromController();
+        refreshState();
     }
 
     private MediaController pick(List<MediaController> controllers) {
@@ -344,13 +410,10 @@ public class MediaDisplayService extends Service {
             if (state == null) {
                 continue;
             }
-            int code = state.getState();
-            if (code == PlaybackState.STATE_PLAYING
-                    || code == PlaybackState.STATE_BUFFERING
-                    || code == PlaybackState.STATE_CONNECTING) {
+            if (isPlayingState(state.getState())) {
                 return item;
             }
-            if (code == PlaybackState.STATE_PAUSED && paused == null) {
+            if (paused == null && isActiveState(state.getState()) && item.getMetadata() != null) {
                 paused = item;
             }
         }
@@ -367,29 +430,26 @@ public class MediaDisplayService extends Service {
         return left.getSessionToken().equals(right.getSessionToken());
     }
 
-    private void publishFromController() {
-        if (controller == null) {
-            artGeneration++;
-            publish(MediaSnapshot.inactive());
-            requestFinishUi();
-            handler.removeCallbacks(ensureRunnable);
+    private void refreshState() {
+        MediaController current = controller;
+        PlaybackState state = current == null ? null : current.getPlaybackState();
+        MediaMetadata metadata = current == null ? null : current.getMetadata();
+        if (state == null || metadata == null || !isActiveState(state.getState())) {
+            if (snapshot.active && !inactivePending) {
+                inactivePending = true;
+                handler.postDelayed(inactiveRunnable, INACTIVE_GRACE_MS);
+            }
             return;
         }
-        PlaybackState state = controller.getPlaybackState();
-        MediaMetadata metadata = controller.getMetadata();
-        if (state == null || !isActiveState(state.getState())) {
-            artGeneration++;
-            publish(MediaSnapshot.inactive());
-            requestFinishUi();
-            handler.removeCallbacks(ensureRunnable);
-            return;
-        }
+        inactivePending = false;
+        handler.removeCallbacks(inactiveRunnable);
+
         String title = text(metadata, MediaMetadata.METADATA_KEY_TITLE);
         String artist = text(metadata, MediaMetadata.METADATA_KEY_ARTIST);
         if (artist.isEmpty()) {
             artist = text(metadata, MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
         }
-        long duration = metadata == null ? 0 : metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
+        long duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
         long actions = state.getActions();
         boolean canPrev = hasAction(actions, PlaybackState.ACTION_SKIP_TO_PREVIOUS);
         boolean canNext = hasAction(actions, PlaybackState.ACTION_SKIP_TO_NEXT);
@@ -403,55 +463,85 @@ public class MediaDisplayService extends Service {
             canPlay = true;
             canPause = true;
         }
-        boolean playing = state.getState() != PlaybackState.STATE_PAUSED;
-        Bitmap immediate = artworkBitmap(metadata);
-        int generation = ++artGeneration;
-        if (immediate != null) {
-            Bitmap copy = scaleArtwork(immediate);
-            publish(new MediaSnapshot(true, playing, title, artist, copy, themeColor(copy), duration,
-                    canPrev, canNext, canPlay, canPause));
-            ensureUi();
-            startHeartbeat();
+        boolean playing = isPlayingState(state.getState());
+        updateArtwork(current.getPackageName(), metadata);
+
+        publish(new MediaSnapshot(true, playing, title, artist, artwork, artworkColor, duration,
+                canPrev, canNext, canPlay, canPause));
+        if (!uiWanted) {
+            startUi();
+        }
+    }
+
+    /** 专辑图按内容取样做键，同一张图不重复缩放和取色 */
+    private void updateArtwork(String packageName, MediaMetadata metadata) {
+        Bitmap source = artworkBitmap(metadata);
+        if (source != null) {
+            String key = packageName + "|bmp|" + bitmapKey(source);
+            if (key.equals(artworkKey)) {
+                return;
+            }
+            artworkKey = key;
+            artwork = scaleArtwork(source);
+            artworkColor = themeColor(artwork);
             return;
         }
         String uri = artworkUri(metadata);
-        publish(new MediaSnapshot(true, playing, title, artist, snapshot.artwork,
-                snapshot.artwork == null ? DEFAULT_THEME : snapshot.themeColor, duration,
-                canPrev, canNext, canPlay, canPause));
-        ensureUi();
-        startHeartbeat();
         if (uri == null) {
-            publish(new MediaSnapshot(true, playing, title, artist, null, DEFAULT_THEME, duration,
-                    canPrev, canNext, canPlay, canPause));
+            String key = packageName + "|none|" + text(metadata, MediaMetadata.METADATA_KEY_ALBUM);
+            if (!key.equals(artworkKey)) {
+                artworkKey = key;
+                artwork = null;
+                artworkColor = DEFAULT_THEME;
+            }
             return;
         }
-        final String titleFinal = title;
-        final String artistFinal = artist;
-        final boolean playingFinal = playing;
-        final long durationFinal = duration;
-        final boolean prevFinal = canPrev;
-        final boolean nextFinal = canNext;
-        final boolean playFinal = canPlay;
-        final boolean pauseFinal = canPause;
+        String key = packageName + "|uri|" + uri;
+        if (key.equals(artworkKey) || uri.equals(loadingUri)) {
+            return;
+        }
+        loadingUri = uri;
         new Thread(() -> {
-            Bitmap loaded = loadArtwork(uri);
-            Bitmap copy = scaleArtwork(loaded);
-            int color = themeColor(copy);
+            Bitmap scaled = scaleArtwork(loadArtwork(uri));
+            int color = themeColor(scaled);
             handler.post(() -> {
-                if (generation != artGeneration) {
+                if (!uri.equals(loadingUri)) {
                     return;
                 }
-                publish(new MediaSnapshot(true, playingFinal, titleFinal, artistFinal, copy, color,
-                        durationFinal, prevFinal, nextFinal, playFinal, pauseFinal));
+                loadingUri = null;
+                artworkKey = key;
+                artwork = scaled;
+                artworkColor = color;
+                refreshState();
             });
         }, "media-art").start();
     }
 
-    private boolean isActiveState(int state) {
+    private static String bitmapKey(Bitmap bitmap) {
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        long hash = width * 31L + height;
+        for (int i = 1; i <= 4; i++) {
+            for (int j = 1; j <= 4; j++) {
+                hash = hash * 31 + bitmap.getPixel(width * i / 5, height * j / 5);
+            }
+        }
+        return width + "x" + height + ":" + hash;
+    }
+
+    private static boolean isPlayingState(int state) {
         return state == PlaybackState.STATE_PLAYING
-                || state == PlaybackState.STATE_PAUSED
                 || state == PlaybackState.STATE_BUFFERING
-                || state == PlaybackState.STATE_CONNECTING;
+                || state == PlaybackState.STATE_CONNECTING
+                || state == PlaybackState.STATE_FAST_FORWARDING
+                || state == PlaybackState.STATE_REWINDING
+                || state == PlaybackState.STATE_SKIPPING_TO_NEXT
+                || state == PlaybackState.STATE_SKIPPING_TO_PREVIOUS
+                || state == PlaybackState.STATE_SKIPPING_TO_QUEUE_ITEM;
+    }
+
+    private static boolean isActiveState(int state) {
+        return isPlayingState(state) || state == PlaybackState.STATE_PAUSED;
     }
 
     private boolean hasAction(long actions, long flag) {
@@ -467,13 +557,13 @@ public class MediaDisplayService extends Service {
     }
 
     private Bitmap artworkBitmap(MediaMetadata metadata) {
-        if (metadata == null) {
-            return null;
-        }
         try {
             Bitmap art = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
             if (art == null) {
                 art = metadata.getBitmap(MediaMetadata.METADATA_KEY_ART);
+            }
+            if (art == null && metadata.getDescription() != null) {
+                art = metadata.getDescription().getIconBitmap();
             }
             return art;
         } catch (Exception e) {
@@ -483,9 +573,6 @@ public class MediaDisplayService extends Service {
     }
 
     private String artworkUri(MediaMetadata metadata) {
-        if (metadata == null) {
-            return null;
-        }
         String uri = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI);
         if (uri == null || uri.isEmpty()) {
             uri = metadata.getString(MediaMetadata.METADATA_KEY_ART_URI);
@@ -548,43 +635,115 @@ public class MediaDisplayService extends Service {
     }
 
     private void publish(MediaSnapshot next) {
+        if (next.sameAs(snapshot)) {
+            return;
+        }
         snapshot = next;
-        for (Listener listener : new ArrayList<>(listeners)) {
+        for (Listener listener : listeners) {
             listener.onMediaChanged(next);
         }
     }
 
-    private void startHeartbeat() {
-        handler.removeCallbacks(ensureRunnable);
-        handler.postDelayed(ensureRunnable, 1500);
+    private void startUi() {
+        uiWanted = true;
+        launchUi();
+        handler.removeCallbacks(keeperRunnable);
+        handler.postDelayed(keeperRunnable, KEEPER_MS);
     }
 
-    private void ensureUi() {
-        if (!snapshot.active || MediaDisplayActivity.isAlive()) {
+    private void stopUi() {
+        boolean wasWanted = uiWanted;
+        uiWanted = false;
+        handler.removeCallbacks(keeperRunnable);
+        sendBroadcast(new Intent(ACTION_FINISH).setPackage(getPackageName()));
+        if (!wasWanted) {
             return;
         }
-        long now = SystemClock.elapsedRealtime();
-        if (now - lastLaunchMs < 2000) {
+        ITaskService service = taskService;
+        if (service == null || shell.isShutdown()) {
             return;
         }
-        if (taskService == null) {
+        shell.execute(() -> {
+            try {
+                service.enableSubScreenLauncher();
+            } catch (Exception e) {
+                Log.w(TAG, "恢复背屏桌面失败", e);
+            }
+        });
+    }
+
+    private void launchUi() {
+        ITaskService service = taskService;
+        if (service == null) {
             bindTaskService();
             return;
         }
-        lastLaunchMs = now;
-        String cmd = "am start --display 1 -n " + getPackageName() + "/.MediaDisplayActivity";
+        if (shell.isShutdown()) {
+            return;
+        }
+        shell.execute(() -> {
+            try {
+                service.disableSubScreenLauncher();
+                service.executeShellCommand(launchCommand());
+                SystemClock.sleep(600);
+                moveUiToRearIfNeeded(service);
+            } catch (Exception e) {
+                Log.e(TAG, "启动背屏媒体界面失败", e);
+            }
+        });
+    }
+
+    private void keepUiOnTop() {
+        ITaskService service = taskService;
+        if (service == null) {
+            bindTaskService();
+            return;
+        }
+        if (shell.isShutdown()) {
+            return;
+        }
+        shell.execute(() -> {
+            if (!uiWanted) {
+                return;
+            }
+            try {
+                String front = service.getForegroundAppOnDisplay(1);
+                if (front != null && front.startsWith(getPackageName() + ":")) {
+                    return;
+                }
+                service.disableSubScreenLauncher();
+                service.executeShellCommand(launchCommand());
+                SystemClock.sleep(600);
+                moveUiToRearIfNeeded(service);
+            } catch (Exception e) {
+                Log.w(TAG, "确认背屏媒体界面失败", e);
+            }
+        });
+    }
+
+    /** am start --display 1 偶尔会落到主屏，确认后纠正 */
+    private void moveUiToRearIfNeeded(ITaskService service) {
         try {
-            boolean ok = taskService.executeShellCommand(cmd);
-            if (!ok) {
-                Log.w(TAG, "启动背屏媒体界面失败");
+            String front = service.getForegroundAppOnDisplay(1);
+            if (front != null && front.startsWith(getPackageName() + ":")) {
+                return;
+            }
+            String list = service.executeShellCommandWithResult(
+                    "am stack list | grep " + getPackageName() + "/.MediaDisplayActivity");
+            if (list == null || list.isEmpty()) {
+                return;
+            }
+            Matcher matcher = Pattern.compile("taskId=(\\d+)").matcher(list);
+            if (matcher.find()) {
+                service.moveTaskToDisplay(Integer.parseInt(matcher.group(1)), 1);
             }
         } catch (Exception e) {
-            Log.e(TAG, "启动背屏媒体界面异常", e);
+            Log.w(TAG, "纠正背屏落屏失败", e);
         }
     }
 
-    private void requestFinishUi() {
-        sendBroadcast(new Intent(ACTION_FINISH).setPackage(getPackageName()));
+    private String launchCommand() {
+        return "am start --display 1 -n " + getPackageName() + "/.MediaDisplayActivity";
     }
 
     private void bindTaskService() {
