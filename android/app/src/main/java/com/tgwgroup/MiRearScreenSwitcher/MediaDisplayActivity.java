@@ -33,7 +33,6 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
 import android.util.TypedValue;
@@ -179,9 +178,12 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         getWindow().getDecorView().setBackgroundColor(Color.TRANSPARENT);
 
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                | WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true);
+            setTurnScreenOn(true);
         }
 
         displayManager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
@@ -600,8 +602,8 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         int state = display == null ? Display.STATE_UNKNOWN : display.getState();
         boolean on;
         if (state == Display.STATE_UNKNOWN) {
-            PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
-            on = rearScreenOn && (power == null || power.isInteractive());
+            // isInteractive() 只表示正屏。正屏息屏时背屏仍可能亮着
+            on = rearScreenOn;
         } else {
             on = state == Display.STATE_ON;
         }

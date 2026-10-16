@@ -243,7 +243,8 @@
             android:theme="@style/Theme.MediaDisplay"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode|smallestScreenSize|density"
             android:enableOnBackInvokedCallback="true"
-            android:showWhenLocked="true">
+            android:showWhenLocked="true"
+            android:turnScreenOn="true">
             <meta-data android:name="miui.rear.policy" android:value="miui"/>
         </activity>
             

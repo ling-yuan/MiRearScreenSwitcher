@@ -1023,6 +1023,54 @@ public class TaskService extends ITaskService.Stub {
     }
 
     private void readEdgeDevice(FileInputStream stream, int generation) {
+        while (edgeGeneration.get() == generation) {
+            boolean ended = false;
+            try {
+                ended = !readEdgeStream(stream, generation);
+            } catch (Exception e) {
+                if (edgeGeneration.get() != generation) {
+                    return;
+                }
+                Log.w(TAG, "读取背屏触摸事件失败", e);
+                ended = true;
+            }
+            if (!ended || edgeGeneration.get() != generation) {
+                return;
+            }
+            try {
+                stream.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                return;
+            }
+            if (edgeGeneration.get() != generation) {
+                return;
+            }
+            try {
+                stream = new FileInputStream(rearTouchDevice);
+            } catch (Exception e) {
+                Log.w(TAG, "重新打开背屏触摸设备失败", e);
+                continue;
+            }
+            synchronized (edgeLock) {
+                if (edgeGeneration.get() != generation) {
+                    try {
+                        stream.close();
+                    } catch (Exception ignored) {
+                    }
+                    return;
+                }
+                edgeStream = stream;
+            }
+            Log.d(TAG, "rear edge reader reopened");
+        }
+    }
+
+    /** @return false 表示这次读取结束，需要重新打开设备 */
+    private boolean readEdgeStream(FileInputStream stream, int generation) throws Exception {
         float maxX = rearTouchMaxX;
         float maxY = rearTouchMaxY;
         byte[] raw = new byte[24];
@@ -1035,8 +1083,7 @@ public class TaskService extends ITaskService.Stub {
         float startX = 0f;
         float startY = 0f;
         boolean hasStart = false;
-        try {
-            while (edgeGeneration.get() == generation && readFully(stream, raw)) {
+        while (edgeGeneration.get() == generation && readFully(stream, raw)) {
                 buffer.clear();
                 buffer.getLong();
                 buffer.getLong();
@@ -1105,7 +1152,7 @@ public class TaskService extends ITaskService.Stub {
                     continue;
                 }
                 if (edgeGeneration.get() != generation) {
-                    return;
+                    return false;
                 }
                 Log.d(TAG, "rear edge swipe detected");
                 edgeMatched = true;
@@ -1114,13 +1161,9 @@ public class TaskService extends ITaskService.Stub {
                     hit.countDown();
                 }
                 recallMediaUi();
-                return;
-            }
-        } catch (Exception e) {
-            if (edgeGeneration.get() == generation) {
-                Log.w(TAG, "读取背屏触摸事件失败", e);
-            }
+                return true;
         }
+        return false;
     }
 
     private static boolean readFully(FileInputStream stream, byte[] raw) throws Exception {
@@ -1141,6 +1184,10 @@ public class TaskService extends ITaskService.Stub {
      */
     private void recallMediaUi() {
         try {
+            // 只唤醒背屏。正屏息屏时不先唤醒，媒体界面不会显示出来
+            new ProcessBuilder("input", "-d", "1", "keyevent", "KEYCODE_WAKEUP")
+                    .redirectErrorStream(true).start().waitFor();
+            Thread.sleep(200);
             Process process = new ProcessBuilder("sh", "-c",
                     "am force-stop com.xiaomi.subscreencenter; "
                             + "am start --display 1 -n com.tgwgroup.MiRearScreenSwitcher/.MediaDisplayActivity --ez "
@@ -1180,7 +1227,7 @@ public class TaskService extends ITaskService.Stub {
                         continue;
                     }
                     seenTask = true;
-                    home = line.contains("SubScreenLauncher");
+                    home = line.contains("com.xiaomi.subscreencenter");
                 }
             }
             process.destroy();
