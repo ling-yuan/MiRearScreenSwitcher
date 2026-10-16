@@ -221,6 +221,10 @@ public class UriCommandService extends IntentService {
      * 切换当前应用到背屏 - 完全复用TileService的逻辑
      */
     private void switchCurrentAppToRear() {
+        if (MediaDisplayService.isModeEnabled(this)) {
+            showToast(getString(R.string.toast_media_blocks_cast));
+            return;
+        }
         try {
             // 步骤0: 检查背屏是否已有应用在运行（复用TileService逻辑）
             String lastMovedTask = SwitchToRearTileService.getLastMovedTask();
@@ -344,6 +348,10 @@ public class UriCommandService extends IntentService {
      * 切换指定应用到背屏（packageName或activity）
      */
     private void switchSpecificAppToRear(String activity, String packageName, Uri uri) {
+        if (MediaDisplayService.isModeEnabled(this)) {
+            showToast(getString(R.string.toast_media_blocks_cast));
+            return;
+        }
         try {
             // 步骤0: 先设置DPI和旋转（在启动应用前设置好背屏参数）
             applyConfigParams(uri);

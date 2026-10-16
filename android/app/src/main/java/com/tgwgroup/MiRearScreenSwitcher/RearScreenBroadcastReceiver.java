@@ -64,9 +64,11 @@ public class RearScreenBroadcastReceiver extends BroadcastReceiver {
         }
         if ("miui.intent.action.SUB_SCREEN_ON".equals(action)) {
             // 背屏点亮时的处理
+            MediaDisplayActivity.setRearScreenOn(true);
             handleScreenOn(context);
         } else if ("miui.intent.action.SUB_SCREEN_OFF".equals(action)) {
             // 背屏熄灭时的处理
+            MediaDisplayActivity.setRearScreenOn(false);
             handleScreenOff(context);
         } else if (Intent.ACTION_SCREEN_OFF.equals(action)) {
             // 系统屏幕关闭（可能是双击息屏）

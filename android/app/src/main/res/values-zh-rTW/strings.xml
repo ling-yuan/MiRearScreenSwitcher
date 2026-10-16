@@ -4,6 +4,13 @@
     <string name="tile_label">切換至背屏</string>
     <string name="tile_screenshot_label">獲取背屏截圖</string>
     <string name="tile_record_label">背屏錄屏</string>
+    <string name="tile_media_label">背屏媒體顯示</string>
+    <string name="toast_media_blocks_cast">請先關閉背屏媒體顯示</string>
+    <string name="toast_cast_blocks_media">請先將應用切換回主屏</string>
+    <string name="toast_need_notification_listener">請先開啟通知使用權</string>
+    <string name="media_prev">上一首</string>
+    <string name="media_next">下一首</string>
+    <string name="media_play_pause">暫停或播放</string>
     <string name="uninstall_title">😭你真的要卸載MRSS嗎？😭\n😭你真的要卸載MRSS嗎？😭\n😭你真的要卸載MRSS嗎？😭\n</string>
     <string name="uninstall_content">\n\n\n😭回來吧MRSS😭\n🌟我最驕傲的信仰🌟\n⚡️歷歷在目背屏場⚡️\n😭眼淚莫名在流淌😭\n💥依稀記得app投背💥\n👍還有給力的裝備(作者註:指am force-stop)👍\n⚡️把小米SubScreenCenter都給打退⚡️\n✨通宵熬夜都不累✨\n\n\n</string>
     <string name="privacy_mode_enabled">隱私模式已啟用</string>

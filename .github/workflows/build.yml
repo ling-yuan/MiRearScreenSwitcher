@@ -4,6 +4,8 @@ permissions:
   contents: write
 
 on:
+  # Manual run from the Actions tab.
+  workflow_dispatch:
   push:
     paths-ignore:
       - '**.md'
@@ -77,6 +79,6 @@ jobs:
         with:
           name: "${{ github.ref_name }}"
           # https://github.com/settings/personal-access-tokens/new
-          token: ${{ secrets.PAT }}
+          token: ${{ github.token }}
           files: |
             MRSS-${{ github.ref_name }}-release.apk

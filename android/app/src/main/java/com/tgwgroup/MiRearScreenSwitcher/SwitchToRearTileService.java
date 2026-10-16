@@ -86,7 +86,7 @@ public class SwitchToRearTileService extends TileService {
 
         Tile tile = getQsTile();
         if (tile != null) {
-            tile.setState(Tile.STATE_INACTIVE);
+            tile.setState(idleTileState());
             tile.setSubtitle(null);
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                 tile.setStateDescription("");
@@ -184,6 +184,21 @@ public class SwitchToRearTileService extends TileService {
     }
 
     private void performSwitch() {
+        if (MediaDisplayService.isModeEnabled(this)) {
+            showTemporaryFeedback(getString(R.string.toast_media_blocks_cast));
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+                try {
+                    if (taskService != null) {
+                        taskService.collapseStatusBar();
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to collapse: " + e.getMessage());
+                }
+                Toast.makeText(this, R.string.toast_media_blocks_cast, Toast.LENGTH_SHORT).show();
+            }, 300);
+            return;
+        }
+
         // 显示执行中状态 - 保持按钮外观，只改变副标题
         Tile tile = getQsTile();
         if (tile != null) {
@@ -342,6 +357,13 @@ public class SwitchToRearTileService extends TileService {
         }
     }
 
+    private int idleTileState() {
+        if (MediaDisplayService.isModeEnabled(this)) {
+            return Tile.STATE_UNAVAILABLE;
+        }
+        return Tile.STATE_INACTIVE;
+    }
+
     private void showTemporaryFeedback(String message) {
         Tile tile = getQsTile();
         if (tile != null) {
@@ -356,7 +378,7 @@ public class SwitchToRearTileService extends TileService {
         new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
             Tile resetTile = getQsTile();
             if (resetTile != null) {
-                resetTile.setState(Tile.STATE_INACTIVE);
+                resetTile.setState(idleTileState());
                 resetTile.setSubtitle(null);
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                     resetTile.setStateDescription("");

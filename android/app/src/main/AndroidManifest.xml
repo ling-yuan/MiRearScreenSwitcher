@@ -78,6 +78,18 @@
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
+
+        <!-- Quick Settings Tile - 背屏媒体显示 -->
+        <service
+            android:name=".MediaDisplayTileService"
+            android:icon="@drawable/ic_tile_media"
+            android:label="@string/tile_media_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
         
         <!-- 监听背屏状态和系统屏幕状态广播接收器 -->
         <receiver
@@ -156,6 +168,17 @@
                 android:value="背屏录屏服务"/>
         </service>
 
+        <!-- 背屏媒体显示 -->
+        <service
+            android:name=".MediaDisplayService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="背屏媒体显示"/>
+        </service>
+
         
         <!-- 背屏唤醒Activity（已废弃，改用Service） -->
         <activity
@@ -207,6 +230,20 @@
             android:directBootAware="true"
             android:showWhenLocked="true"
             android:turnScreenOn="true">
+            <meta-data android:name="miui.rear.policy" android:value="miui"/>
+        </activity>
+
+        <!-- 背屏媒体显示 -->
+        <activity
+            android:name=".MediaDisplayActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:taskAffinity="com.tgwgroup.MiRearScreenSwitcher.media"
+            android:theme="@style/Theme.MediaDisplay"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|uiMode|smallestScreenSize|density"
+            android:enableOnBackInvokedCallback="true"
+            android:showWhenLocked="true">
             <meta-data android:name="miui.rear.policy" android:value="miui"/>
         </activity>
             

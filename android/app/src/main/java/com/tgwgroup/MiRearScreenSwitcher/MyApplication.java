@@ -14,6 +14,7 @@
 package com.tgwgroup.MiRearScreenSwitcher;
 
 import android.content.Context;
+import android.content.Intent;
 import android.os.Build;
 import android.util.Log;
 import io.flutter.app.FlutterApplication;
@@ -54,6 +55,18 @@ public class MyApplication extends FlutterApplication {
     @Override
     public void onCreate() {
         super.onCreate();
+        if (MediaDisplayService.isModeEnabled(this)) {
+            try {
+                Intent intent = new Intent(this, MediaDisplayService.class);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent);
+                } else {
+                    startService(intent);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "启动背屏媒体显示失败", e);
+            }
+        }
     }
     
     public static boolean isSui() {
