@@ -788,7 +788,7 @@ public class MediaDisplayService extends Service {
                 long started = SystemClock.elapsedRealtime();
                 boolean swiped;
                 try {
-                    swiped = service.waitRearEdgeSwipe(rearRotation(), 30_000L);
+                    swiped = service.waitRearEdgeSwipe(rearRotation(), 3_000L);
                 } catch (Exception e) {
                     Log.w(TAG, "监听背屏手势失败", e);
                     swiped = false;
