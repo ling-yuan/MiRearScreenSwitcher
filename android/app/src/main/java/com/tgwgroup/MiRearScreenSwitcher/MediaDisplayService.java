@@ -302,6 +302,29 @@ public class MediaDisplayService extends Service {
         }
     }
 
+    /** 把一次点击或滑动补到背屏，给原来的背屏桌面 */
+    public static void injectRearPointer(int x1, int y1, int x2, int y2, long durationMs, boolean tap) {
+        MediaDisplayService service = instance;
+        if (service == null || service.shell.isShutdown()) {
+            return;
+        }
+        int safeDuration = (int) Math.max(40, Math.min(500, durationMs));
+        service.shell.execute(() -> {
+            ITaskService task = service.taskService;
+            if (task == null) {
+                return;
+            }
+            String command = tap
+                    ? "input -d 1 tap " + x1 + " " + y1
+                    : "input -d 1 swipe " + x1 + " " + y1 + " " + x2 + " " + y2 + " " + safeDuration;
+            try {
+                task.executeShellCommand(command);
+            } catch (Exception e) {
+                Log.w(TAG, "转发背屏手势失败", e);
+            }
+        });
+    }
+
     /** 收起时恢复背屏桌面；展开时关掉桌面并把媒体界面拉回背屏 */
     public static void setCollapsed(boolean collapsed) {
         MediaDisplayService service = instance;
