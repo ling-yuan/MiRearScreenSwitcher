@@ -1184,12 +1184,11 @@ public class TaskService extends ITaskService.Stub {
      */
     private void recallMediaUi() {
         try {
-            // 只唤醒背屏。正屏息屏时不先唤醒，媒体界面不会显示出来
-            new ProcessBuilder("input", "-d", "1", "keyevent", "KEYCODE_WAKEUP")
-                    .redirectErrorStream(true).start().waitFor();
-            Thread.sleep(200);
+            // 正屏锁屏时也必须先点亮背屏，再启动，并把任务钉在 display 1
             Process process = new ProcessBuilder("sh", "-c",
-                    "am force-stop com.xiaomi.subscreencenter; "
+                    "input -d 1 keyevent KEYCODE_WAKEUP; "
+                            + "sleep 0.2; "
+                            + "am force-stop com.xiaomi.subscreencenter; "
                             + "am start --display 1 -n com.tgwgroup.MiRearScreenSwitcher/.MediaDisplayActivity --ez "
                             + MediaDisplayActivity.EXTRA_RECALL + " true")
                     .redirectErrorStream(true)
@@ -1201,9 +1200,41 @@ public class TaskService extends ITaskService.Stub {
                 }
             }
             process.waitFor();
+            Thread.sleep(300);
+            int taskId = findMediaDisplayTaskId();
+            if (taskId > 0) {
+                moveTaskToDisplay(taskId, 1);
+            }
         } catch (Exception e) {
             Log.w(TAG, "拉出媒体界面失败", e);
         }
+    }
+
+    private int findMediaDisplayTaskId() {
+        try {
+            Process process = new ProcessBuilder("sh", "-c", "am stack list")
+                    .redirectErrorStream(true).start();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (!line.contains("MediaDisplayActivity") || !line.contains("taskId=")) {
+                        continue;
+                    }
+                    int start = line.indexOf("taskId=") + 7;
+                    int end = start;
+                    while (end < line.length() && Character.isDigit(line.charAt(end))) {
+                        end++;
+                    }
+                    if (end > start) {
+                        return Integer.parseInt(line.substring(start, end));
+                    }
+                }
+            }
+            process.waitFor();
+        } catch (Exception e) {
+            Log.w(TAG, "查找媒体界面任务失败", e);
+        }
+        return -1;
     }
 
     /** 背屏最前面是主界面，或背屏上没有界面。相机等其他界面返回 false */

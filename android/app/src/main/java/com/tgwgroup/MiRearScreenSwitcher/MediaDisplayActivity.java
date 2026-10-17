@@ -237,9 +237,9 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             }
             MediaDisplayService.setCollapsed(false);
         }
-        // am start 偶尔落到主屏：退到后台，等服务把任务移到背屏
+        // 锁屏时 am start 可能落到主屏。不能 moveTaskToBack，否则界面会消失
         if (!isOnRearDisplay()) {
-            moveTaskToBack(true);
+            MediaDisplayService.ensureOnRearDisplay();
         }
         updateDisplayState();
         handler.post(pollRunnable);
@@ -271,6 +271,9 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             layer.setVisibility(View.VISIBLE);
             layer.setAlpha(1f);
             layer.setTranslationX(0f);
+        }
+        if (!isOnRearDisplay()) {
+            MediaDisplayService.ensureOnRearDisplay();
         }
     }
 

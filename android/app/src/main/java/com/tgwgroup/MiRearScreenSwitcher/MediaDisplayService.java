@@ -337,6 +337,25 @@ public class MediaDisplayService extends Service {
         service.handler.post(service::applyCollapsedWork);
     }
 
+    /** 锁屏后 am start 可能落到主屏，把媒体界面任务挪回背屏 */
+    public static void ensureOnRearDisplay() {
+        MediaDisplayService service = instance;
+        if (service == null || service.shell.isShutdown()) {
+            return;
+        }
+        service.shell.execute(() -> {
+            ITaskService task = service.taskService;
+            if (task == null || service.uiCollapsed || !service.uiWanted) {
+                return;
+            }
+            try {
+                service.moveUiToRearIfNeeded(task);
+            } catch (Exception e) {
+                Log.w(TAG, "纠正背屏落屏失败", e);
+            }
+        });
+    }
+
     public static void refreshTiles(Context context) {
         TileService.requestListeningState(context,
                 new ComponentName(context, MediaDisplayTileService.class));
@@ -1098,7 +1117,7 @@ public class MediaDisplayService extends Service {
                 if (!uiWanted || uiCollapsed) {
                     return;
                 }
-                service.executeShellCommand(launchCommand());
+                service.executeShellCommand(launchCommand(false));
                 SystemClock.sleep(600);
                 if (!uiWanted || uiCollapsed) {
                     return;
@@ -1168,12 +1187,15 @@ public class MediaDisplayService extends Service {
                     Log.w(TAG, "监听背屏手势失败", e);
                     swiped = false;
                 }
-                if (swiped && uiWanted && uiCollapsed && edgeWatcher == self[0]) {
+                if (swiped && uiWanted && edgeWatcher == self[0]) {
                     Log.d(TAG, "rear edge swipe: expand media ui");
+                    // 不要求此时仍为 collapsed：TaskService 可能已先拉起界面并清掉收起标志
                     handler.post(() -> {
-                        if (uiWanted && uiCollapsed) {
-                            setCollapsed(false);
+                        if (!uiWanted) {
+                            return;
                         }
+                        uiCollapsed = false;
+                        applyCollapsedWork();
                     });
                     break;
                 }
@@ -1229,11 +1251,22 @@ public class MediaDisplayService extends Service {
                 return;
             }
             try {
+                // 正屏锁屏时也要先点亮背屏，再带 recall 启动，最后确认落在背屏
+                service.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
+                SystemClock.sleep(200);
+                if (uiCollapsed || !uiWanted) {
+                    return;
+                }
                 service.disableSubScreenLauncher();
                 if (uiCollapsed || !uiWanted) {
                     return;
                 }
-                service.executeShellCommand(launchCommand());
+                service.executeShellCommand(launchCommand(true));
+                SystemClock.sleep(400);
+                if (uiCollapsed || !uiWanted) {
+                    return;
+                }
+                moveUiToRearIfNeeded(service);
             } catch (Exception e) {
                 Log.w(TAG, "展开媒体界面失败", e);
             }
@@ -1290,7 +1323,7 @@ public class MediaDisplayService extends Service {
                 if (!uiWanted || uiCollapsed) {
                     return;
                 }
-                service.executeShellCommand(launchCommand());
+                service.executeShellCommand(launchCommand(true));
                 SystemClock.sleep(600);
                 if (!uiWanted || uiCollapsed) {
                     return;
@@ -1315,16 +1348,24 @@ public class MediaDisplayService extends Service {
                 return;
             }
             Matcher matcher = Pattern.compile("taskId=(\\d+)").matcher(list);
-            if (matcher.find()) {
-                service.moveTaskToDisplay(Integer.parseInt(matcher.group(1)), 1);
+            if (!matcher.find()) {
+                return;
             }
+            int taskId = Integer.parseInt(matcher.group(1));
+            service.moveTaskToDisplay(taskId, 1);
+            // 锁屏时再拉一次，避免任务挪过去后仍不可见
+            service.executeShellCommand(launchCommand(true));
         } catch (Exception e) {
             Log.w(TAG, "纠正背屏落屏失败", e);
         }
     }
 
-    private String launchCommand() {
-        return "am start --display 1 -n " + getPackageName() + "/.MediaDisplayActivity";
+    private String launchCommand(boolean recall) {
+        String cmd = "am start --display 1 -n " + getPackageName() + "/.MediaDisplayActivity";
+        if (recall) {
+            cmd += " --ez " + MediaDisplayActivity.EXTRA_RECALL + " true";
+        }
+        return cmd;
     }
 
     private void bindTaskService() {
