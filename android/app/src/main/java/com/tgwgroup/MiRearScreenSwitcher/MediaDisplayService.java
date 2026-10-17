@@ -42,6 +42,9 @@ import android.service.quicksettings.TileService;
 import android.util.Log;
 import android.view.Display;
 
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -64,9 +67,12 @@ public class MediaDisplayService extends Service {
     private static final int NOTIFICATION_ID = 10005;
     private static final int DEFAULT_THEME = 0xFF4A2030;
     private static final long POLL_MS = 1000L;
+    /** 有 LRC 时单独快刷当前句，避免歌词换句慢一拍 */
+    private static final long LYRIC_TICK_MS = 200L;
     private static final long KEEPER_MS = 3000L;
     /** 切歌时播放器会短暂上报停止，超过这个时长才认为没有媒体 */
     private static final long INACTIVE_GRACE_MS = 3000L;
+    private static final int REAR_DISPLAY_ID = 1;
     private static final Pattern LRC_TAG = Pattern.compile(
             "\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{2,3}))?\\]");
 
@@ -155,6 +161,7 @@ public class MediaDisplayService extends Service {
     private String cachedArtist = "";
     private String cachedLyricSource = "";
     private List<LyricLine> lyricLines = new ArrayList<>();
+    private Boolean lastRearPowerOn;
 
     private final Shizuku.UserServiceArgs serviceArgs = new Shizuku.UserServiceArgs(
             new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -215,7 +222,21 @@ public class MediaDisplayService extends Service {
         @Override
         public void run() {
             refreshSessions();
+            syncRearDisplayPower();
             handler.postDelayed(this, POLL_MS);
+        }
+    };
+
+    /** 有时间轴歌词时按进度快刷当前句 */
+    private final Runnable lyricTickRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!uiWanted || lyricLines.isEmpty()) {
+                return;
+            }
+            refreshLyricOnly();
+            syncRearDisplayPower();
+            handler.postDelayed(this, LYRIC_TICK_MS);
         }
     };
 
@@ -363,7 +384,13 @@ public class MediaDisplayService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
+        // 开关重开时清掉上一次收起状态，否则不会再拉起界面
+        uiCollapsed = false;
         registerSessions();
+        refreshSessions();
+        if (snapshot.active) {
+            startUi();
+        }
         refreshTiles(this);
         return START_STICKY;
     }
@@ -505,6 +532,7 @@ public class MediaDisplayService extends Service {
         }
 
         String rawTitle = text(metadata, MediaMetadata.METADATA_KEY_TITLE);
+        String displayTitle = text(metadata, MediaMetadata.METADATA_KEY_DISPLAY_TITLE);
         String artist = text(metadata, MediaMetadata.METADATA_KEY_ARTIST);
         if (artist.isEmpty()) {
             artist = text(metadata, MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
@@ -512,9 +540,15 @@ public class MediaDisplayService extends Service {
         String album = text(metadata, MediaMetadata.METADATA_KEY_ALBUM);
         long duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
         rememberTrack(current.getPackageName(), duration, album);
-        String lyric = currentLyric(metadata, state, rawTitle, artist, album);
-        String title = stableTitle(rawTitle, lyric);
+        String lyric;
+        try {
+            lyric = currentLyric(metadata, state, rawTitle, artist, album);
+        } catch (Exception e) {
+            Log.w(TAG, "解析歌词失败", e);
+            lyric = "";
+        }
         artist = stableArtist(artist, lyric);
+        String title = stableTitle(rawTitle, displayTitle, lyric, artist);
         long actions = state == null ? 0 : state.getActions();
         boolean canPrev = hasAction(actions, PlaybackState.ACTION_SKIP_TO_PREVIOUS);
         boolean canNext = hasAction(actions, PlaybackState.ACTION_SKIP_TO_NEXT);
@@ -535,7 +569,54 @@ public class MediaDisplayService extends Service {
                 canPrev, canNext, canPlay, canPause));
         if (!uiWanted) {
             startUi();
+        } else if (!uiCollapsed && !MediaDisplayActivity.isAlive()) {
+            launchUi();
         }
+        scheduleLyricTick(playing);
+    }
+
+    private void scheduleLyricTick(boolean playing) {
+        handler.removeCallbacks(lyricTickRunnable);
+        if (playing && !lyricLines.isEmpty() && uiWanted) {
+            handler.postDelayed(lyricTickRunnable, LYRIC_TICK_MS);
+        }
+    }
+
+    /** 只更新当前句歌词，不重读整份会话 */
+    private void refreshLyricOnly() {
+        if (!snapshot.active || lyricLines.isEmpty()) {
+            return;
+        }
+        String lyric = lineAt(currentPosition());
+        if (lyric.equals(snapshot.lyric)) {
+            return;
+        }
+        publish(new MediaSnapshot(true, snapshot.playing, snapshot.title, snapshot.artist, lyric,
+                snapshot.artwork, snapshot.themeColor, snapshot.durationMs, snapshot.canPrev,
+                snapshot.canNext, snapshot.canPlay, snapshot.canPause));
+    }
+
+    /** 前台服务不受息屏冻结影响。只在背屏电源变化时通知界面，避免冲掉双击息屏 */
+    private void syncRearDisplayPower() {
+        DisplayManager manager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+        Display display = manager == null ? null : manager.getDisplay(REAR_DISPLAY_ID);
+        if (display == null) {
+            return;
+        }
+        int state = display.getState();
+        boolean on = state == Display.STATE_ON || state == Display.STATE_UNKNOWN;
+        if (state == Display.STATE_OFF
+                || state == Display.STATE_DOZE
+                || state == Display.STATE_DOZE_SUSPEND
+                || state == Display.STATE_ON_SUSPEND) {
+            on = false;
+        }
+        if (lastRearPowerOn != null && lastRearPowerOn == on) {
+            return;
+        }
+        lastRearPowerOn = on;
+        Log.d(TAG, "rear display power " + (on ? "on" : "off"));
+        MediaDisplayActivity.onRearPowerChanged(on);
     }
 
     /** 专辑图按内容取样做键，同一张图不重复缩放和取色 */
@@ -635,15 +716,27 @@ public class MediaDisplayService extends Service {
         lyricLines = new ArrayList<>();
     }
 
-    private String stableTitle(String rawTitle, String lyric) {
-        String cleaned = stripLyricPrefix(rawTitle, lyric);
-        if (isStableName(cleaned, lyric)) {
-            cachedTitle = cleaned;
+    private String stableTitle(String rawTitle, String displayTitle, String lyric, String artist) {
+        String fromDisplay = extractSongTitle(displayTitle, lyric, artist);
+        String fromRaw = extractSongTitle(rawTitle, lyric, artist);
+        String candidate = "";
+        if (isStableName(fromDisplay, lyric)) {
+            candidate = fromDisplay;
+        } else if (isStableName(fromRaw, lyric)) {
+            candidate = fromRaw;
+        }
+        if (!candidate.isEmpty() && (cachedTitle.isEmpty() || isBetterTitle(candidate, cachedTitle, lyric))) {
+            cachedTitle = candidate;
         }
         if (!cachedTitle.isEmpty()) {
+            // 歌词后到时，再剥一次已缓存的“歌词-歌名-作者”
+            String improved = extractSongTitle(cachedTitle, lyric, artist);
+            if (isStableName(improved, lyric) && isBetterTitle(improved, cachedTitle, lyric)) {
+                cachedTitle = improved;
+            }
             return cachedTitle;
         }
-        return cleaned;
+        return candidate;
     }
 
     private String stableArtist(String rawArtist, String lyric) {
@@ -653,24 +746,70 @@ public class MediaDisplayService extends Service {
         if (!cachedArtist.isEmpty()) {
             return cachedArtist;
         }
-        return rawArtist;
+        return rawArtist == null ? "" : rawArtist;
     }
 
     private static boolean isStableName(String value, String lyric) {
         if (value == null || value.isEmpty() || looksLikeLrc(value)) {
             return false;
         }
-        return lyric.isEmpty() || !value.equals(lyric);
+        if (!lyric.isEmpty() && (value.equals(lyric) || value.startsWith(lyric + "-")
+                || value.startsWith(lyric + "—"))) {
+            return false;
+        }
+        return true;
     }
 
-    private static String stripLyricPrefix(String title, String lyric) {
+    private static boolean isBetterTitle(String next, String current, String lyric) {
+        if (current.isEmpty()) {
+            return true;
+        }
+        if (next.equals(current)) {
+            return false;
+        }
+        if (!lyric.isEmpty() && current.contains(lyric) && !next.contains(lyric)) {
+            return true;
+        }
+        return next.length() < current.length() && current.contains(next);
+    }
+
+    /** 处理网易云等“当前歌词-歌名-作者”标题 */
+    private static String extractSongTitle(String title, String lyric, String artist) {
         if (title == null || title.isEmpty()) {
             return "";
         }
-        if (lyric.isEmpty() || !title.startsWith(lyric)) {
-            return title;
+        String value = title.trim();
+        if (!artist.isEmpty()) {
+            // 三节标题：歌词-歌名-作者
+            String[] parts = value.split("[-—]", 3);
+            if (parts.length == 3 && artist.equals(parts[2].trim()) && !parts[1].trim().isEmpty()) {
+                return parts[1].trim();
+            }
         }
-        return title.substring(lyric.length()).replaceFirst("^[-—\\s]+", "").trim();
+        if (!lyric.isEmpty() && value.startsWith(lyric)) {
+            value = value.substring(lyric.length()).replaceFirst("^[-—\\s]+", "").trim();
+        }
+        if (!artist.isEmpty()) {
+            String suffix = "-" + artist;
+            String suffixCn = "—" + artist;
+            if (value.endsWith(suffix)) {
+                value = value.substring(0, value.length() - suffix.length()).trim();
+            } else if (value.endsWith(suffixCn)) {
+                value = value.substring(0, value.length() - suffixCn.length()).trim();
+            }
+        }
+        if (!lyric.isEmpty()) {
+            int dash = Math.max(value.lastIndexOf('-'), value.lastIndexOf('—'));
+            if (dash > 0) {
+                String left = value.substring(0, dash).trim();
+                String right = value.substring(dash + 1).trim();
+                if (!right.isEmpty() && (left.equals(lyric) || lyric.startsWith(left)
+                        || left.startsWith(lyric))) {
+                    return right;
+                }
+            }
+        }
+        return value;
     }
 
     /** 当前一句歌词。整份 LRC 按播放进度取一行 */
@@ -834,7 +973,20 @@ public class MediaDisplayService extends Service {
 
     private Bitmap loadArtwork(String uri) {
         try {
-            return MediaStore.Images.Media.getBitmap(getContentResolver(), Uri.parse(uri));
+            Uri parsed = Uri.parse(uri);
+            String scheme = parsed.getScheme();
+            if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+                HttpURLConnection connection = (HttpURLConnection) new URL(uri).openConnection();
+                connection.setConnectTimeout(5000);
+                connection.setReadTimeout(5000);
+                connection.setInstanceFollowRedirects(true);
+                try (InputStream stream = connection.getInputStream()) {
+                    return android.graphics.BitmapFactory.decodeStream(stream);
+                } finally {
+                    connection.disconnect();
+                }
+            }
+            return MediaStore.Images.Media.getBitmap(getContentResolver(), parsed);
         } catch (Exception e) {
             Log.w(TAG, "读取专辑图失败", e);
             return null;
@@ -908,6 +1060,7 @@ public class MediaDisplayService extends Service {
         boolean wasWanted = uiWanted;
         uiWanted = false;
         uiCollapsed = false;
+        handler.removeCallbacks(lyricTickRunnable);
         stopEdgeWatch();
         handler.removeCallbacks(keeperRunnable);
         sendBroadcast(new Intent(ACTION_FINISH).setPackage(getPackageName()));

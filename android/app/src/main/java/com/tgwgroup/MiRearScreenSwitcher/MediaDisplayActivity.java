@@ -173,10 +173,17 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
 
     public static void setRearScreenOn(boolean on) {
         rearScreenOn = on;
+        onRearPowerChanged(on);
+    }
+
+    /** 由前台服务在背屏电源变化时调用。息屏时 Activity 可能被冻结，不能只靠自己轮询 */
+    public static void onRearPowerChanged(boolean on) {
+        rearScreenOn = on;
         MediaDisplayActivity activity = instance;
-        if (activity != null) {
-            activity.runOnUiThread(activity::updateDisplayState);
+        if (activity == null) {
+            return;
         }
+        activity.runOnUiThread(() -> activity.applyRearPower(on, "power"));
     }
 
     @Override
@@ -393,9 +400,14 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 || Math.abs(event.getY() - touchStartY) > touchSlop;
     }
 
-    /** 背屏仍亮着时，双击只切换歌词行和控制行。正屏状态不参与 */
+    /** 背屏仍亮着时，双击只切换歌词行和控制行。真正熄灭/点亮以电源回调为准 */
     private void toggleRearSleep() {
         setRearAsleep(!rearAsleep, "tap");
+    }
+
+    private void applyRearPower(boolean on, String reason) {
+        displayOn = on;
+        setRearAsleep(!on, reason);
     }
 
     private void setRearAsleep(boolean asleep, String reason) {
@@ -698,17 +710,20 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         Display display = displayManager == null ? null : displayManager.getDisplay(REAR_DISPLAY_ID);
         int state = display == null ? Display.STATE_UNKNOWN : display.getState();
         boolean on;
-        if (state == Display.STATE_UNKNOWN) {
-            // isInteractive() 只表示正屏。正屏息屏时背屏仍可能亮着
-            on = rearScreenOn;
+        if (state == Display.STATE_OFF
+                || state == Display.STATE_DOZE
+                || state == Display.STATE_DOZE_SUSPEND
+                || state == Display.STATE_ON_SUSPEND) {
+            on = false;
+        } else if (state == Display.STATE_ON) {
+            on = true;
         } else {
-            on = state == Display.STATE_ON;
+            on = rearScreenOn;
         }
         if (on == displayOn) {
             return;
         }
-        displayOn = on;
-        setRearAsleep(!on, on ? "display on" : "display off");
+        applyRearPower(on, on ? "display on" : "display off");
     }
 
     private void updateClock() {
