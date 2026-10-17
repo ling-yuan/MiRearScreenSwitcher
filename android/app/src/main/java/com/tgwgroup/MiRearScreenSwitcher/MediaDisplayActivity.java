@@ -713,12 +713,12 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         Display display = displayManager == null ? null : displayManager.getDisplay(REAR_DISPLAY_ID);
         int state = display == null ? Display.STATE_UNKNOWN : display.getState();
         boolean on;
-        if (state == Display.STATE_OFF
+        if (state == Display.STATE_OFF) {
+            on = false;
+        } else if (state == Display.STATE_ON
                 || state == Display.STATE_DOZE
                 || state == Display.STATE_DOZE_SUSPEND
                 || state == Display.STATE_ON_SUSPEND) {
-            on = false;
-        } else if (state == Display.STATE_ON) {
             on = true;
         } else {
             on = rearScreenOn;

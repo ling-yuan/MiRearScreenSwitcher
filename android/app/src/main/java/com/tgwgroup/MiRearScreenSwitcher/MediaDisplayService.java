@@ -174,8 +174,13 @@ public class MediaDisplayService extends Service {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
             taskService = ITaskService.Stub.asInterface(binder);
+            Log.d(TAG, "TaskService connected");
             handler.post(() -> {
+                refreshSessions();
                 if (!uiWanted) {
+                    if (snapshot.active) {
+                        startUi();
+                    }
                     return;
                 }
                 if (uiCollapsed) {
@@ -389,6 +394,7 @@ public class MediaDisplayService extends Service {
     public void onCreate() {
         super.onCreate();
         instance = this;
+        Log.d(TAG, "MediaDisplayService onCreate");
         startForeground(NOTIFICATION_ID, RearScreenKeeperService.createServiceNotification(this));
         sessionManager = (MediaSessionManager) getSystemService(MEDIA_SESSION_SERVICE);
         bindTaskService();
@@ -400,15 +406,21 @@ public class MediaDisplayService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         startForeground(NOTIFICATION_ID, RearScreenKeeperService.createServiceNotification(this));
         if (!isModeEnabled(this)) {
+            Log.w(TAG, "mode disabled, stopSelf");
             stopSelf();
             return START_NOT_STICKY;
         }
         // 开关重开时清掉上一次收起状态，否则不会再拉起界面
         uiCollapsed = false;
+        Log.d(TAG, "onStartCommand, refresh sessions");
         registerSessions();
         refreshSessions();
         if (snapshot.active) {
             startUi();
+        } else {
+            // 会话有时晚到，延后再拉一次
+            handler.postDelayed(this::refreshSessions, 500);
+            handler.postDelayed(this::refreshSessions, 2000);
         }
         refreshTiles(this);
         return START_STICKY;
@@ -480,8 +492,12 @@ public class MediaDisplayService extends Service {
     }
 
     private void onSessionsChanged(List<MediaController> controllers) {
-        MediaController next = pick(controllers == null ? new ArrayList<>() : controllers);
+        List<MediaController> list = controllers == null ? new ArrayList<>() : controllers;
+        MediaController next = pick(list);
         sessionsEmpty = next == null;
+        Log.d(TAG, "sessions=" + list.size()
+                + " pick=" + (next == null ? "null" : next.getPackageName())
+                + " active=" + snapshot.active + " wanted=" + uiWanted);
         if (next == null && controller != null && controller.getMetadata() != null) {
             if (snapshot.active && !inactivePending) {
                 inactivePending = true;
@@ -587,8 +603,10 @@ public class MediaDisplayService extends Service {
         publish(new MediaSnapshot(true, playing, title, artist, lyric, artwork, artworkColor, duration,
                 canPrev, canNext, canPlay, canPause));
         if (!uiWanted) {
+            Log.d(TAG, "media active, startUi title=" + title);
             startUi();
         } else if (!uiCollapsed && !MediaDisplayActivity.isAlive()) {
+            Log.d(TAG, "media active but ui missing, launchUi");
             launchUi();
         }
         scheduleLyricTick(playing);
@@ -623,18 +641,13 @@ public class MediaDisplayService extends Service {
             return;
         }
         int state = display.getState();
-        boolean on = state == Display.STATE_ON || state == Display.STATE_UNKNOWN;
-        if (state == Display.STATE_OFF
-                || state == Display.STATE_DOZE
-                || state == Display.STATE_DOZE_SUSPEND
-                || state == Display.STATE_ON_SUSPEND) {
-            on = false;
-        }
+        // 只有明确熄灭才算 off。DOZE/ON_SUSPEND 在小米背屏上仍可能在显示内容
+        boolean on = state != Display.STATE_OFF;
         if (lastRearPowerOn != null && lastRearPowerOn == on) {
             return;
         }
         lastRearPowerOn = on;
-        Log.d(TAG, "rear display power " + (on ? "on" : "off"));
+        Log.d(TAG, "rear display power " + (on ? "on" : "off") + " state=" + state);
         MediaDisplayActivity.onRearPowerChanged(on);
     }
 
@@ -1070,6 +1083,7 @@ public class MediaDisplayService extends Service {
     private void startUi() {
         uiCollapsed = false;
         uiWanted = true;
+        Log.d(TAG, "startUi");
         launchUi();
         handler.removeCallbacks(keeperRunnable);
         handler.postDelayed(keeperRunnable, KEEPER_MS);
@@ -1102,22 +1116,32 @@ public class MediaDisplayService extends Service {
     private void launchUi() {
         ITaskService service = taskService;
         if (service == null) {
+            Log.d(TAG, "launchUi wait TaskService");
             bindTaskService();
             return;
         }
         if (shell.isShutdown()) {
+            Log.w(TAG, "launchUi skipped, shell shutdown");
             return;
         }
         shell.execute(() -> {
             if (!uiWanted || uiCollapsed) {
+                Log.w(TAG, "launchUi skipped wanted=" + uiWanted + " collapsed=" + uiCollapsed);
                 return;
             }
             try {
+                // 背屏熄灭时必须先唤醒，否则 am start 后用户什么都看不到
+                service.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
+                SystemClock.sleep(200);
+                if (!uiWanted || uiCollapsed) {
+                    return;
+                }
                 service.disableSubScreenLauncher();
                 if (!uiWanted || uiCollapsed) {
                     return;
                 }
-                service.executeShellCommand(launchCommand(false));
+                Log.d(TAG, "launchUi am start");
+                service.executeShellCommand(launchCommand(true));
                 SystemClock.sleep(600);
                 if (!uiWanted || uiCollapsed) {
                     return;
@@ -1316,6 +1340,12 @@ public class MediaDisplayService extends Service {
                 if (front != null && front.startsWith(getPackageName() + ":")) {
                     return;
                 }
+                Log.d(TAG, "keepUiOnTop front=" + front);
+                if (!uiWanted || uiCollapsed) {
+                    return;
+                }
+                service.executeShellCommand("input -d 1 keyevent KEYCODE_WAKEUP");
+                SystemClock.sleep(200);
                 if (!uiWanted || uiCollapsed) {
                     return;
                 }
@@ -1374,16 +1404,19 @@ public class MediaDisplayService extends Service {
         }
         try {
             if (!Shizuku.pingBinder()) {
-                Log.w(TAG, "Shizuku 未就绪");
+                Log.w(TAG, "Shizuku 未就绪，稍后重试");
+                handler.postDelayed(this::bindTaskService, 1000);
                 return;
             }
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
                 Log.w(TAG, "没有 Shizuku 权限");
                 return;
             }
+            Log.d(TAG, "bind TaskService");
             Shizuku.bindUserService(serviceArgs, taskServiceConnection);
         } catch (Exception e) {
             Log.e(TAG, "绑定 TaskService 失败", e);
+            handler.postDelayed(this::bindTaskService, 1500);
         }
     }
 
