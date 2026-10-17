@@ -74,6 +74,8 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private static final float SWIPE_RATIO = 0.12f;
     /** 两次点击都落在这个时间内，才算双击背屏 */
     private static final long DOUBLE_TAP_MS = 320L;
+    /** 切换息屏后忽略这段时间内的触摸，避免系统双击的剩余事件再翻一次 */
+    private static final long SLEEP_TOGGLE_COOLDOWN_MS = 400L;
     /** 左侧摄像头区域占屏宽的比例，内容只放在右侧 */
     private static final float CAMERA_ZONE_RATIO = 1f / 3f;
 
@@ -113,6 +115,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private long lastTapMs;
     private float lastTapX;
     private float lastTapY;
+    private long lastSleepToggleMs;
     private int sizedWidth;
     private int sizedHeight;
     private float albumRadius;
@@ -304,6 +307,11 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         if (width <= 0f) {
             return super.dispatchTouchEvent(event);
         }
+        if (SystemClock.elapsedRealtime() - lastSleepToggleMs < SLEEP_TOGGLE_COOLDOWN_MS) {
+            consumeDoubleTap = false;
+            tapCandidate = false;
+            lastTapMs = 0;
+        }
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 consumeDoubleTap = false;
@@ -311,7 +319,8 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 trackingEdge = event.getX() >= width * (1f - EDGE_ZONE_RATIO);
                 touchStartX = event.getX();
                 touchStartY = event.getY();
-                if (isDoubleTap(event)) {
+                if (SystemClock.elapsedRealtime() - lastSleepToggleMs >= SLEEP_TOGGLE_COOLDOWN_MS
+                        && isDoubleTap(event)) {
                     consumeDoubleTap = true;
                     tapCandidate = false;
                     lastTapMs = 0;
@@ -384,10 +393,18 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 || Math.abs(event.getY() - touchStartY) > touchSlop;
     }
 
-    /** 双击切换背屏息屏。正屏是否锁屏、息屏不改变这个状态 */
+    /** 背屏仍亮着时，双击只切换歌词行和控制行。正屏状态不参与 */
     private void toggleRearSleep() {
-        rearAsleep = !rearAsleep;
-        Log.d(TAG, rearAsleep ? "rear screen sleep" : "rear screen awake");
+        setRearAsleep(!rearAsleep, "tap");
+    }
+
+    private void setRearAsleep(boolean asleep, String reason) {
+        lastSleepToggleMs = SystemClock.elapsedRealtime();
+        if (rearAsleep == asleep) {
+            return;
+        }
+        rearAsleep = asleep;
+        Log.d(TAG, (asleep ? "rear screen sleep" : "rear screen awake") + " (" + reason + ")");
         applyChrome();
     }
 
@@ -608,6 +625,9 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
 
     /** 背屏息屏时隐藏歌词行和控制行。不跟随正屏 */
     private void applyChrome() {
+        if (subtitle == null || controls == null) {
+            return;
+        }
         int line = rearAsleep ? View.GONE : View.VISIBLE;
         subtitle.setVisibility(line);
         controls.setVisibility(line);
@@ -688,6 +708,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             return;
         }
         displayOn = on;
+        setRearAsleep(!on, on ? "display on" : "display off");
     }
 
     private void updateClock() {

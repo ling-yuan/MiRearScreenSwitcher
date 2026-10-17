@@ -67,6 +67,8 @@ public class MediaDisplayService extends Service {
     private static final long KEEPER_MS = 3000L;
     /** 切歌时播放器会短暂上报停止，超过这个时长才认为没有媒体 */
     private static final long INACTIVE_GRACE_MS = 3000L;
+    private static final Pattern LRC_TAG = Pattern.compile(
+            "\\[(\\d{1,2}):(\\d{2})(?:[.:](\\d{2,3}))?\\]");
 
     public interface Listener {
         void onMediaChanged(MediaSnapshot snapshot);
@@ -141,11 +143,18 @@ public class MediaDisplayService extends Service {
     /** 收起期间在后台读背屏触摸事件，等待拉出手势 */
     private volatile Thread edgeWatcher;
     private boolean inactivePending;
+    /** 锁屏后会话列表可能暂时为空，这时先保留上一首，仍走 3 秒宽限 */
+    private boolean sessionsEmpty;
 
     private String artworkKey = "";
     private Bitmap artwork;
     private int artworkColor = DEFAULT_THEME;
     private String loadingUri;
+    private String trackKey = "";
+    private String cachedTitle = "";
+    private String cachedArtist = "";
+    private String cachedLyricSource = "";
+    private List<LyricLine> lyricLines = new ArrayList<>();
 
     private final Shizuku.UserServiceArgs serviceArgs = new Shizuku.UserServiceArgs(
             new ComponentName("com.tgwgroup.MiRearScreenSwitcher", TaskService.class.getName()))
@@ -426,6 +435,15 @@ public class MediaDisplayService extends Service {
 
     private void onSessionsChanged(List<MediaController> controllers) {
         MediaController next = pick(controllers == null ? new ArrayList<>() : controllers);
+        sessionsEmpty = next == null;
+        if (next == null && controller != null && controller.getMetadata() != null) {
+            if (snapshot.active && !inactivePending) {
+                inactivePending = true;
+                handler.postDelayed(inactiveRunnable, INACTIVE_GRACE_MS);
+            }
+            refreshState();
+            return;
+        }
         if (!sameSession(controller, next)) {
             if (controller != null) {
                 controller.unregisterCallback(controllerCallback);
@@ -440,19 +458,24 @@ public class MediaDisplayService extends Service {
 
     private MediaController pick(List<MediaController> controllers) {
         MediaController paused = null;
+        MediaController withMeta = null;
         for (MediaController item : controllers) {
             PlaybackState state = item.getPlaybackState();
-            if (state == null) {
-                continue;
-            }
-            if (isPlayingState(state.getState())) {
+            MediaMetadata metadata = item.getMetadata();
+            if (state != null && isPlayingState(state.getState())) {
                 return item;
             }
-            if (paused == null && isActiveState(state.getState()) && item.getMetadata() != null) {
+            if (metadata == null) {
+                continue;
+            }
+            if (paused == null && state != null && isActiveState(state.getState())) {
                 paused = item;
             }
+            if (withMeta == null) {
+                withMeta = item;
+            }
         }
-        return paused;
+        return paused != null ? paused : withMeta;
     }
 
     private boolean sameSession(MediaController left, MediaController right) {
@@ -469,25 +492,30 @@ public class MediaDisplayService extends Service {
         MediaController current = controller;
         PlaybackState state = current == null ? null : current.getPlaybackState();
         MediaMetadata metadata = current == null ? null : current.getMetadata();
-        if (state == null || metadata == null || !isActiveState(state.getState())) {
+        if (current == null || metadata == null) {
             if (snapshot.active && !inactivePending) {
                 inactivePending = true;
                 handler.postDelayed(inactiveRunnable, INACTIVE_GRACE_MS);
             }
             return;
         }
-        inactivePending = false;
-        handler.removeCallbacks(inactiveRunnable);
+        if (!sessionsEmpty) {
+            inactivePending = false;
+            handler.removeCallbacks(inactiveRunnable);
+        }
 
-        String title = text(metadata, MediaMetadata.METADATA_KEY_TITLE);
+        String rawTitle = text(metadata, MediaMetadata.METADATA_KEY_TITLE);
         String artist = text(metadata, MediaMetadata.METADATA_KEY_ARTIST);
         if (artist.isEmpty()) {
             artist = text(metadata, MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
         }
         String album = text(metadata, MediaMetadata.METADATA_KEY_ALBUM);
-        String lyric = currentLyric(metadata, state, title, artist, album);
         long duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
-        long actions = state.getActions();
+        rememberTrack(current.getPackageName(), duration, album);
+        String lyric = currentLyric(metadata, state, rawTitle, artist, album);
+        String title = stableTitle(rawTitle, lyric);
+        artist = stableArtist(artist, lyric);
+        long actions = state == null ? 0 : state.getActions();
         boolean canPrev = hasAction(actions, PlaybackState.ACTION_SKIP_TO_PREVIOUS);
         boolean canNext = hasAction(actions, PlaybackState.ACTION_SKIP_TO_NEXT);
         boolean canPlay = hasAction(actions, PlaybackState.ACTION_PLAY)
@@ -500,7 +528,7 @@ public class MediaDisplayService extends Service {
             canPlay = true;
             canPause = true;
         }
-        boolean playing = isPlayingState(state.getState());
+        boolean playing = state != null && isPlayingState(state.getState());
         updateArtwork(current.getPackageName(), metadata);
 
         publish(new MediaSnapshot(true, playing, title, artist, lyric, artwork, artworkColor, duration,
@@ -585,8 +613,84 @@ public class MediaDisplayService extends Service {
         return (actions & flag) != 0;
     }
 
-    /** 当前一句歌词。播放器可能写在元数据或播放状态的附加字段里 */
+    private static final class LyricLine {
+        final long timeMs;
+        final String text;
+
+        LyricLine(long timeMs, String text) {
+            this.timeMs = timeMs;
+            this.text = text;
+        }
+    }
+
+    private void rememberTrack(String packageName, long duration, String album) {
+        String key = packageName + "|" + duration + "|" + album;
+        if (key.equals(trackKey)) {
+            return;
+        }
+        trackKey = key;
+        cachedTitle = "";
+        cachedArtist = "";
+        cachedLyricSource = "";
+        lyricLines = new ArrayList<>();
+    }
+
+    private String stableTitle(String rawTitle, String lyric) {
+        String cleaned = stripLyricPrefix(rawTitle, lyric);
+        if (isStableName(cleaned, lyric)) {
+            cachedTitle = cleaned;
+        }
+        if (!cachedTitle.isEmpty()) {
+            return cachedTitle;
+        }
+        return cleaned;
+    }
+
+    private String stableArtist(String rawArtist, String lyric) {
+        if (isStableName(rawArtist, lyric)) {
+            cachedArtist = rawArtist;
+        }
+        if (!cachedArtist.isEmpty()) {
+            return cachedArtist;
+        }
+        return rawArtist;
+    }
+
+    private static boolean isStableName(String value, String lyric) {
+        if (value == null || value.isEmpty() || looksLikeLrc(value)) {
+            return false;
+        }
+        return lyric.isEmpty() || !value.equals(lyric);
+    }
+
+    private static String stripLyricPrefix(String title, String lyric) {
+        if (title == null || title.isEmpty()) {
+            return "";
+        }
+        if (lyric.isEmpty() || !title.startsWith(lyric)) {
+            return title;
+        }
+        return title.substring(lyric.length()).replaceFirst("^[-—\\s]+", "").trim();
+    }
+
+    /** 当前一句歌词。整份 LRC 按播放进度取一行 */
     private String currentLyric(MediaMetadata metadata, PlaybackState state, String title, String artist,
+            String album) {
+        String source = lyricSource(metadata, state, title, artist, album);
+        if (source.isEmpty()) {
+            return "";
+        }
+        if (looksLikeLrc(source)) {
+            if (!source.equals(cachedLyricSource)) {
+                cachedLyricSource = source;
+                lyricLines = parseLrc(source);
+            }
+            return lineAt(currentPosition());
+        }
+        return stripLrcTags(source);
+    }
+
+    private String lyricSource(MediaMetadata metadata, PlaybackState state, String title, String artist,
             String album) {
         String fromState = lyricInBundle(state == null ? null : state.getExtras(), title, artist, album);
         if (!fromState.isEmpty()) {
@@ -640,6 +744,60 @@ public class MediaDisplayService extends Service {
             return "";
         }
         return lyric;
+    }
+
+    private static boolean looksLikeLrc(String value) {
+        if (value == null || value.indexOf('[') < 0) {
+            return false;
+        }
+        Matcher matcher = LRC_TAG.matcher(value);
+        return matcher.find() && matcher.find();
+    }
+
+    private static List<LyricLine> parseLrc(String source) {
+        List<LyricLine> lines = new ArrayList<>();
+        Matcher matcher = LRC_TAG.matcher(source);
+        while (matcher.find()) {
+            int start = matcher.end();
+            int end = source.indexOf('[', start);
+            if (end < 0) {
+                end = source.length();
+            }
+            String text = stripLrcTags(source.substring(start, end));
+            if (text.isEmpty()) {
+                continue;
+            }
+            int minute = Integer.parseInt(matcher.group(1));
+            int second = Integer.parseInt(matcher.group(2));
+            String fraction = matcher.group(3);
+            int millis = 0;
+            if (fraction != null) {
+                millis = Integer.parseInt(fraction);
+                if (fraction.length() == 2) {
+                    millis *= 10;
+                }
+            }
+            lines.add(new LyricLine(minute * 60_000L + second * 1000L + millis, text));
+        }
+        return lines;
+    }
+
+    private String lineAt(long positionMs) {
+        String current = "";
+        for (LyricLine line : lyricLines) {
+            if (line.timeMs > positionMs) {
+                break;
+            }
+            current = line.text;
+        }
+        return current;
+    }
+
+    private static String stripLrcTags(String value) {
+        if (value == null) {
+            return "";
+        }
+        return LRC_TAG.matcher(value).replaceAll("").replace('\n', ' ').trim();
     }
 
     private String text(MediaMetadata metadata, String key) {
