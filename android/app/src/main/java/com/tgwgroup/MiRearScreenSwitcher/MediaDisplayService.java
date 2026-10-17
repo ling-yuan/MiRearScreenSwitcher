@@ -592,10 +592,6 @@ public class MediaDisplayService extends Service {
         if (!fromState.isEmpty()) {
             return fromState;
         }
-        String fromMetadata = lyricInBundle(metadata == null ? null : metadata.getBundle(), title, artist, album);
-        if (!fromMetadata.isEmpty()) {
-            return fromMetadata;
-        }
         if (metadata != null) {
             for (String key : metadata.keySet()) {
                 if (key == null || !key.toLowerCase(Locale.US).contains("lyric")) {
