@@ -34,10 +34,12 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.text.TextUtils;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Display;
 import android.view.MotionEvent;
+import android.view.ViewConfiguration;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
@@ -70,6 +72,8 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private static final float EDGE_ZONE_RATIO = 0.30f;
     /** 触发隐藏所需的横向滑动距离占屏宽的比例 */
     private static final float SWIPE_RATIO = 0.12f;
+    /** 两次点击都落在这个时间内，才算双击背屏 */
+    private static final long DOUBLE_TAP_MS = 320L;
     /** 左侧摄像头区域占屏宽的比例，内容只放在右侧 */
     private static final float CAMERA_ZONE_RATIO = 1f / 3f;
 
@@ -101,6 +105,14 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
     private boolean hidden;
     private boolean hiddenSettled;
     private boolean displayOn = true;
+    /** 背屏自己的息屏。与正屏锁屏、息屏无关 */
+    private boolean rearAsleep;
+    private int touchSlop;
+    private boolean tapCandidate;
+    private boolean consumeDoubleTap;
+    private long lastTapMs;
+    private float lastTapX;
+    private float lastTapY;
     private int sizedWidth;
     private int sizedHeight;
     private float albumRadius;
@@ -172,6 +184,7 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             return;
         }
         instance = this;
+        touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
         setContentView(R.layout.activity_media_display);
         bindViews();
         getWindow().setFormat(PixelFormat.TRANSLUCENT);
@@ -293,11 +306,27 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         }
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                consumeDoubleTap = false;
+                tapCandidate = true;
                 trackingEdge = event.getX() >= width * (1f - EDGE_ZONE_RATIO);
                 touchStartX = event.getX();
                 touchStartY = event.getY();
+                if (isDoubleTap(event)) {
+                    consumeDoubleTap = true;
+                    tapCandidate = false;
+                    lastTapMs = 0;
+                    MotionEvent cancel = MotionEvent.obtain(event);
+                    cancel.setAction(MotionEvent.ACTION_CANCEL);
+                    super.dispatchTouchEvent(cancel);
+                    cancel.recycle();
+                    toggleRearSleep();
+                    return true;
+                }
                 break;
             case MotionEvent.ACTION_MOVE:
+                if (tapCandidate && movedPastSlop(event)) {
+                    tapCandidate = false;
+                }
                 if (trackingEdge) {
                     float dx = event.getX() - touchStartX;
                     float dy = event.getY() - touchStartY;
@@ -313,13 +342,53 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 }
                 break;
             case MotionEvent.ACTION_UP:
+                trackingEdge = false;
+                if (consumeDoubleTap) {
+                    return true;
+                }
+                if (tapCandidate) {
+                    lastTapMs = event.getEventTime();
+                    lastTapX = event.getX();
+                    lastTapY = event.getY();
+                } else {
+                    lastTapMs = 0;
+                }
+                break;
             case MotionEvent.ACTION_CANCEL:
                 trackingEdge = false;
+                tapCandidate = false;
+                lastTapMs = 0;
+                if (consumeDoubleTap) {
+                    return true;
+                }
                 break;
             default:
                 break;
         }
+        if (consumeDoubleTap) {
+            return true;
+        }
         return super.dispatchTouchEvent(event);
+    }
+
+    private boolean isDoubleTap(MotionEvent event) {
+        if (lastTapMs == 0 || event.getEventTime() - lastTapMs > DOUBLE_TAP_MS) {
+            return false;
+        }
+        float limit = touchSlop * 2f;
+        return Math.abs(event.getX() - lastTapX) <= limit && Math.abs(event.getY() - lastTapY) <= limit;
+    }
+
+    private boolean movedPastSlop(MotionEvent event) {
+        return Math.abs(event.getX() - touchStartX) > touchSlop
+                || Math.abs(event.getY() - touchStartY) > touchSlop;
+    }
+
+    /** 双击切换背屏息屏。正屏是否锁屏、息屏不改变这个状态 */
+    private void toggleRearSleep() {
+        rearAsleep = !rearAsleep;
+        Log.d(TAG, rearAsleep ? "rear screen sleep" : "rear screen awake");
+        applyChrome();
     }
 
     @Override
@@ -330,12 +399,14 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         }
         MediaDisplayService.MediaSnapshot previousSnapshot = snapshot;
         snapshot = value;
-        if (!value.title.contentEquals(title.getText())) {
-            title.setText(value.title);
+        String titleLine = titleLine(value);
+        if (!titleLine.contentEquals(title.getText())) {
+            title.setText(titleLine);
         }
-        String line = subtitleText(value);
-        if (!line.contentEquals(subtitle.getText())) {
-            subtitle.setText(line);
+        if (!value.lyric.contentEquals(subtitle.getText())) {
+            subtitle.setSelected(false);
+            subtitle.setText(value.lyric);
+            subtitle.setSelected(true);
         }
         if (value.artwork != previousSnapshot.artwork || value.themeColor != previousSnapshot.themeColor
                 || !previousSnapshot.active) {
@@ -349,14 +420,14 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         applyChrome();
     }
 
-    private static String subtitleText(MediaDisplayService.MediaSnapshot value) {
+    private static String titleLine(MediaDisplayService.MediaSnapshot value) {
         if (value.artist.isEmpty()) {
             return value.title;
         }
         if (value.title.isEmpty()) {
             return value.artist;
         }
-        return value.title + "-" + value.artist;
+        return value.title + " - " + value.artist;
     }
 
     private void bindViews() {
@@ -370,6 +441,11 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
         album = findViewById(R.id.media_album);
         title = findViewById(R.id.media_title);
         subtitle = findViewById(R.id.media_subtitle);
+        subtitle.setEllipsize(TextUtils.TruncateAt.MARQUEE);
+        subtitle.setMarqueeRepeatLimit(-1);
+        subtitle.setSingleLine(true);
+        subtitle.setHorizontallyScrolling(true);
+        subtitle.setSelected(true);
         controls = findViewById(R.id.media_controls);
         previous = findViewById(R.id.media_prev);
         play = findViewById(R.id.media_play);
@@ -530,13 +606,14 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
                 GradientDrawable.Orientation.TOP_BOTTOM, new int[] {top, bottom}));
     }
 
-    /** 背屏息屏时只保留专辑图片和曲名 */
+    /** 背屏息屏时隐藏歌词行和控制行。不跟随正屏 */
     private void applyChrome() {
-        int full = displayOn ? View.VISIBLE : View.GONE;
-        clock.setVisibility(full);
-        subtitle.setVisibility(full);
-        controls.setVisibility(full);
-        progress.setVisibility(full);
+        int line = rearAsleep ? View.GONE : View.VISIBLE;
+        subtitle.setVisibility(line);
+        controls.setVisibility(line);
+        if (!rearAsleep) {
+            subtitle.setSelected(true);
+        }
     }
 
     private void setHidden(boolean hide, boolean animate) {
@@ -611,7 +688,6 @@ public class MediaDisplayActivity extends Activity implements MediaDisplayServic
             return;
         }
         displayOn = on;
-        applyChrome();
     }
 
     private void updateClock() {

@@ -32,6 +32,7 @@ import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
 import android.media.session.PlaybackState;
 import android.net.Uri;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -43,6 +44,7 @@ import android.view.Display;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -75,6 +77,7 @@ public class MediaDisplayService extends Service {
         public final boolean playing;
         public final String title;
         public final String artist;
+        public final String lyric;
         public final Bitmap artwork;
         public final int themeColor;
         public final long durationMs;
@@ -83,13 +86,14 @@ public class MediaDisplayService extends Service {
         public final boolean canPlay;
         public final boolean canPause;
 
-        MediaSnapshot(boolean active, boolean playing, String title, String artist, Bitmap artwork,
-                int themeColor, long durationMs, boolean canPrev, boolean canNext, boolean canPlay,
-                boolean canPause) {
+        MediaSnapshot(boolean active, boolean playing, String title, String artist, String lyric,
+                Bitmap artwork, int themeColor, long durationMs, boolean canPrev, boolean canNext,
+                boolean canPlay, boolean canPause) {
             this.active = active;
             this.playing = playing;
             this.title = title;
             this.artist = artist;
+            this.lyric = lyric;
             this.artwork = artwork;
             this.themeColor = themeColor;
             this.durationMs = durationMs;
@@ -100,7 +104,7 @@ public class MediaDisplayService extends Service {
         }
 
         static MediaSnapshot inactive() {
-            return new MediaSnapshot(false, false, "", "", null, DEFAULT_THEME, 0,
+            return new MediaSnapshot(false, false, "", "", "", null, DEFAULT_THEME, 0,
                     false, false, false, false);
         }
 
@@ -116,7 +120,8 @@ public class MediaDisplayService extends Service {
                     && canPlay == other.canPlay
                     && canPause == other.canPause
                     && title.equals(other.title)
-                    && artist.equals(other.artist);
+                    && artist.equals(other.artist)
+                    && lyric.equals(other.lyric);
         }
     }
 
@@ -479,6 +484,8 @@ public class MediaDisplayService extends Service {
         if (artist.isEmpty()) {
             artist = text(metadata, MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
         }
+        String album = text(metadata, MediaMetadata.METADATA_KEY_ALBUM);
+        String lyric = currentLyric(metadata, state, title, artist, album);
         long duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION);
         long actions = state.getActions();
         boolean canPrev = hasAction(actions, PlaybackState.ACTION_SKIP_TO_PREVIOUS);
@@ -496,7 +503,7 @@ public class MediaDisplayService extends Service {
         boolean playing = isPlayingState(state.getState());
         updateArtwork(current.getPackageName(), metadata);
 
-        publish(new MediaSnapshot(true, playing, title, artist, artwork, artworkColor, duration,
+        publish(new MediaSnapshot(true, playing, title, artist, lyric, artwork, artworkColor, duration,
                 canPrev, canNext, canPlay, canPause));
         if (!uiWanted) {
             startUi();
@@ -576,6 +583,67 @@ public class MediaDisplayService extends Service {
 
     private boolean hasAction(long actions, long flag) {
         return (actions & flag) != 0;
+    }
+
+    /** 当前一句歌词。播放器可能写在元数据或播放状态的附加字段里 */
+    private String currentLyric(MediaMetadata metadata, PlaybackState state, String title, String artist,
+            String album) {
+        String fromState = lyricInBundle(state == null ? null : state.getExtras(), title, artist, album);
+        if (!fromState.isEmpty()) {
+            return fromState;
+        }
+        String fromMetadata = lyricInBundle(metadata == null ? null : metadata.getBundle(), title, artist, album);
+        if (!fromMetadata.isEmpty()) {
+            return fromMetadata;
+        }
+        if (metadata != null) {
+            for (String key : metadata.keySet()) {
+                if (key == null || !key.toLowerCase(Locale.US).contains("lyric")) {
+                    continue;
+                }
+                String value = usableLyric(text(metadata, key), title, artist, album);
+                if (!value.isEmpty()) {
+                    return value;
+                }
+            }
+        }
+        String description = usableLyric(text(metadata, MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION),
+                title, artist, album);
+        if (!description.isEmpty()) {
+            return description;
+        }
+        return usableLyric(text(metadata, MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE), title, artist, album);
+    }
+
+    private static String lyricInBundle(Bundle bundle, String title, String artist, String album) {
+        if (bundle == null) {
+            return "";
+        }
+        for (String key : bundle.keySet()) {
+            if (key == null || !key.toLowerCase(Locale.US).contains("lyric")) {
+                continue;
+            }
+            Object value = bundle.get(key);
+            if (!(value instanceof CharSequence)) {
+                continue;
+            }
+            String lyric = usableLyric(value.toString(), title, artist, album);
+            if (!lyric.isEmpty()) {
+                return lyric;
+            }
+        }
+        return "";
+    }
+
+    private static String usableLyric(String value, String title, String artist, String album) {
+        if (value == null) {
+            return "";
+        }
+        String lyric = value.trim();
+        if (lyric.isEmpty() || lyric.equals(title) || lyric.equals(artist) || lyric.equals(album)) {
+            return "";
+        }
+        return lyric;
     }
 
     private String text(MediaMetadata metadata, String key) {
